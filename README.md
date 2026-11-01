@@ -6,6 +6,18 @@
 
 ---
 
+## 界面预览
+
+| 首页 · 红果短剧 | 播放（弹幕 / 选集 / 清晰度） |
+| :---: | :---: |
+| ![首页](screenshots/home.png) | ![播放页](screenshots/player.png) |
+| **详情页** | **选集面板** |
+| ![详情页](screenshots/detail.png) | ![选集](screenshots/episodes.png) |
+| **搜索** | **排行榜** |
+| ![搜索](screenshots/search.png) | ![排行榜](screenshots/rank.png) |
+
+---
+
 ## 项目介绍
 
 Free Player 是一个**通用播放器外壳**，本身不含任何影视内容，也不绑定某一个站点。它实现了一套名为 **SourceProtocol v1** 的接口协议：所有片单、菜单、搜索、播放地址都由「源」提供，播放器只负责渲染界面、播放和解密。
