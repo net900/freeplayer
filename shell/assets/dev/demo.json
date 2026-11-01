@@ -1,0 +1,105 @@
+{
+  "source": {
+    "id": "demo",
+    "name": "演示源",
+    "version": "0.1.0",
+    "protocol": "1",
+    "description": "仅用于界面预览的开发数据，不随产品发布",
+    "icon": "",
+    "brand": { "theme": { "seed": "#E8453C", "mode": "auto" } },
+    "capabilities": [
+      "search", "detail", "episodes", "play",
+      "feed", "rank", "new", "category", "ui"
+    ],
+    "auth": { "required": false, "methods": [] }
+  },
+  "ui": {
+    "default_page": "home.feed",
+    "home_tabs": [
+      { "key": "home", "title": "精选", "channel": "home" },
+      { "key": "series", "title": "连载", "channel": "series" }
+    ],
+    "labels": {
+      "play": "播放",
+      "play_full": "观看完整剧集 · 全{count}集",
+      "detail.hot_label": "热度",
+      "detail.follows_label": "追剧",
+      "detail.plays_label": "播放",
+      "detail.tab.episodes": "选集",
+      "detail.tab.series": "系列",
+      "detail.tab.reviews": "剧评",
+      "detail.tab.related": "相关",
+      "detail.related_empty": "暂无相关内容",
+      "new.tab.recommend": "最新",
+      "new.tab.calendar": "日历",
+      "new.gender.all": "全部",
+      "new.gender.male": "男频",
+      "new.gender.female": "女频",
+      "new.empty_day": "这一天还没有内容",
+      "search.type_fallback": "内容",
+      "home.login_required_title": "需要登录",
+      "home.login_required_body": "登录后查看这里的内容。",
+      "home.login_action": "登录"
+    },
+    "navigation": [
+      {
+        "title": "内容",
+        "icon": "home",
+        "items": [
+          { "title": "首页", "icon": "home", "page": "home.feed" },
+          { "title": "榜单", "icon": "leaderboard", "page": "list.rank" },
+          { "title": "新上", "icon": "fiber_new", "page": "list.new" },
+          { "title": "分类", "icon": "category", "page": "list.category" }
+        ]
+      },
+      {
+        "title": "片库",
+        "icon": "video_library",
+        "items": [
+          { "title": "历史", "icon": "history", "page": "library.history" },
+          { "title": "收藏", "icon": "favorite", "page": "library.favorites" },
+          { "title": "下载", "icon": "download", "page": "library.downloads" }
+        ]
+      }
+    ]
+  },
+  "items": [
+    { "id": "d1", "title": "南塘县令有亿点强", "cover": "", "description": "穿越县令断案如神", "type": "series", "badges": ["独播"], "extra": { "latest": "第 32 集" } },
+    { "id": "d2", "title": "归来仍是你", "cover": "", "description": "一场跨越十年的重逢", "type": "series", "badges": [], "extra": { "latest": "第 18 集" } },
+    { "id": "d3", "title": "山月不知心底事", "cover": "", "description": "旧信与旧人", "type": "series", "badges": ["完结"], "extra": { "latest": "全 24 集" } },
+    { "id": "d4", "title": "长安小饭馆", "cover": "", "description": "人间烟火，市井百味", "type": "series", "badges": [], "extra": { "latest": "第 40 集" } },
+    { "id": "d5", "title": "第九次告白", "cover": "", "description": "时间循环里的喜欢", "type": "series", "badges": ["新"], "extra": { "latest": "第 8 集" } },
+    { "id": "d6", "title": "雾港来信", "cover": "", "description": "海雾散尽之前", "type": "series", "badges": [], "extra": { "latest": "第 15 集" } },
+    { "id": "d7", "title": "春风不度", "cover": "", "description": "边城旧事", "type": "series", "badges": [], "extra": { "latest": "第 21 集" } },
+    { "id": "d8", "title": "镜中人", "cover": "", "description": "另一个我", "type": "series", "badges": ["新"], "extra": { "latest": "第 6 集" } },
+    { "id": "d9", "title": "夜航船", "cover": "", "description": "江上夜航，灯火未眠", "type": "series", "badges": [], "extra": { "latest": "第 27 集" } },
+    { "id": "d10", "title": "寻常巷陌", "cover": "", "description": "小城故事", "type": "series", "badges": [], "extra": { "latest": "第 33 集" } },
+    { "id": "d11", "title": "与君书", "cover": "", "description": "一纸家书抵万金", "type": "series", "badges": ["独播"], "extra": { "latest": "第 12 集" } },
+    { "id": "d12", "title": "灯下故人", "cover": "", "description": "灯亮着，人就还在", "type": "series", "badges": [], "extra": { "latest": "第 19 集" } }
+  ],
+  "episodes": {
+    "d1": [
+      { "id": "d1e1", "index": 1, "title": "第 1 集", "duration_sec": 216 },
+      { "id": "d1e2", "index": 2, "title": "第 2 集", "duration_sec": 208 },
+      { "id": "d1e3", "index": 3, "title": "第 3 集", "duration_sec": 222 },
+      { "id": "d1e4", "index": 4, "title": "第 4 集", "duration_sec": 214 },
+      { "id": "d1e5", "index": 5, "title": "第 5 集", "duration_sec": 231 },
+      { "id": "d1e6", "index": 6, "title": "第 6 集", "duration_sec": 205 }
+    ],
+    "d2": [
+      { "id": "d2e1", "index": 1, "title": "第 1 集", "duration_sec": 300 },
+      { "id": "d2e2", "index": 2, "title": "第 2 集", "duration_sec": 295 }
+    ]
+  },
+  "plan": {
+    "item_id": "d1",
+    "episode_id": "d1e1",
+    "streams": [
+      { "id": "1080p", "quality": "1080p", "height": 1080, "width": 1920, "codec": "h264", "container": "mp4", "url": "", "mime_type": "video/mp4" },
+      { "id": "720p", "quality": "720p", "height": 720, "width": 1280, "codec": "h264", "container": "mp4", "url": "", "mime_type": "video/mp4" }
+    ],
+    "decryption": { "required": false, "algorithm": "none", "location": "server" },
+    "expires_at": "2099-01-01T00:00:00Z",
+    "next_episode_id": "d1e2"
+  }
+}
