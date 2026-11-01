@@ -1,0 +1,28 @@
+# Flutter / Dart
+shell/.dart_tool/
+shell/build/
+shell/.flutter-plugins
+shell/.flutter-plugins-dependencies
+shell/windows/flutter/ephemeral/
+**/*.iml
+
+# Go
+server/bin/
+server/*.exe
+server/*.test
+server/coverage.out
+
+# Local state and tooling
+.devtools/
+*.log
+*.tmp
+*.zip
+
+# IDE
+.idea/
+.vscode/
+
+# Build outputs
+native/updater/build/
+dist/
+shot.png
