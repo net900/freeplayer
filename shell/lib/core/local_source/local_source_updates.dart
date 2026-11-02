@@ -59,23 +59,45 @@ Future<LocalSourceUpdateResult> autoUpdateLocalSources({
   final packageIds = <String>{};
   var checked = 0;
   var unresolved = 0;
-  for (final install in localSources.installs) {
-    final url = install.sourceUrl.isNotEmpty
-        ? install.sourceUrl
-        : catalog[install.sourceId]?.packageUrl ?? '';
-    if (url.isEmpty) {
-      unresolved++;
-      continue;
+  // One pass for the whole sweep: an install finishing early must not restart
+  // the app while the remaining packages are still being compared.
+  controller.beginUpdatePass();
+  try {
+    for (final install in localSources.installs) {
+      final url = install.sourceUrl.isNotEmpty
+          ? install.sourceUrl
+          : catalog[install.sourceId]?.packageUrl ?? '';
+      if (url.isEmpty) {
+        unresolved++;
+        continue;
+      }
+      checked++;
+      var installing = false;
+      String? name;
+      try {
+        name = await localSources.refreshFromUrl(
+          install.packageId,
+          url,
+          controller,
+          onUpdate: () {
+            installing = true;
+            controller.beginSourceUpdate(install.name);
+          },
+        );
+      } finally {
+        if (installing) {
+          controller.endSourceUpdate(
+            install.name,
+            updated: name != null,
+          );
+        }
+      }
+      if (name == null) continue;
+      updated.add(name);
+      packageIds.add(install.packageId);
     }
-    checked++;
-    final name = await localSources.refreshFromUrl(
-      install.packageId,
-      url,
-      controller,
-    );
-    if (name == null) continue;
-    updated.add(name);
-    packageIds.add(install.packageId);
+  } finally {
+    controller.endUpdatePass();
   }
   debugPrint(
     'local source updates: checked=$checked updated=${updated.length} '

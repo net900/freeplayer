@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 
 import '../core/local/local_media.dart';
+import '../core/local/single_instance.dart';
 import '../core/local_source/local_source_updates.dart';
+import '../core/logging/app_log.dart';
 import '../core/pages/page_title.dart';
 import '../core/update/update_service.dart';
 import '../core/theme/app_theme.dart';
@@ -13,6 +16,7 @@ import '../core/window/window_resize_handles.dart';
 import '../core/window/window_title_bar.dart';
 import '../features/firstrun/first_run_page.dart';
 import '../features/shell/shell_page.dart';
+import '../features/update/source_update_overlay.dart';
 import '../features/update/update_dialog.dart';
 import '../l10n/strings.dart';
 import 'app_controller.dart';
@@ -20,18 +24,9 @@ import 'app_scope.dart';
 import 'bootstrap.dart';
 
 class FreePlayerApp extends StatefulWidget {
-  const FreePlayerApp({
-    super.key,
-    required this.services,
-    this.coreUpdated,
-  });
+  const FreePlayerApp({super.key, required this.services});
 
   final AppServices services;
-
-  /// Completes once the launch-time core check is done; true when the DLL was
-  /// replaced. The app is already on screen by then, so this is how the
-  /// restart notice reaches it.
-  final Future<bool>? coreUpdated;
 
   @override
   State<FreePlayerApp> createState() => _FreePlayerAppState();
@@ -45,65 +40,61 @@ class _FreePlayerAppState extends State<FreePlayerApp> {
   ThemeData? _darkTheme;
   bool _dragging = false;
 
+  bool _restartScheduled = false;
+
+  AppController get _controller => widget.services.controller;
+
   @override
   void initState() {
     super.initState();
     _scheduleUpdateCheck();
     _checkLocalSourceUpdates();
-    widget.coreUpdated?.then((updated) {
-      if (updated) _notifyRestart(const ['资源核心']);
-    });
+    _controller.addListener(_onControllerChanged);
   }
 
-  /// Silent pass over installed local JS sources: every package is fetched
+  /// Launch pass over installed local JS sources: every package is fetched
   /// again from the address it came from and compared by SHA-256, so a remote
-  /// rebuild is installed without asking. Remote URL sources need no check
-  /// here — their manifest and decryptor modules are refreshed on every launch
-  /// by AppController.refreshUi.
+  /// rebuild is picked up even without a version bump. The controller shows
+  /// the replacement and restarts the app when the pass is over. Remote URL
+  /// sources need no check here — their manifest and decryptor modules are
+  /// refreshed on every launch by AppController.refreshUi.
   Future<void> _checkLocalSourceUpdates() async {
     await Future<void>.delayed(const Duration(seconds: 2));
     if (!mounted) return;
-    final result = await autoUpdateLocalSources(
+    await autoUpdateLocalSources(
       localSources: widget.services.localSources,
-      controller: widget.services.controller,
+      controller: _controller,
     );
-    if (!mounted || result.updated.isEmpty) return;
-    _notifyRestart(result.updated);
   }
 
-  /// Files were replaced under a running app. The pages and the player keep
-  /// the build they loaded, so say plainly that a restart is what applies it,
-  /// instead of silently running a half-updated state.
-  final Set<String> _restartFor = <String>{};
-  Timer? _restartNotice;
+  /// A replacement finished. The pages and the player keep the build they
+  /// loaded, so the only honest state to keep running is a fresh process.
+  void _onControllerChanged() {
+    if (_restartScheduled || !_controller.restartingSoon) return;
+    _restartScheduled = true;
+    // Let the "更新完成" frame reach the screen first.
+    Timer(const Duration(milliseconds: 1200), _restartApp);
+  }
 
-  void _notifyRestart(List<String> parts, {int attempt = 0}) {
-    if (parts.isNotEmpty) _restartFor.addAll(parts);
-    if (!mounted || _restartFor.isEmpty) return;
-    _restartNotice?.cancel();
-    // Batched: the source check and the core check finish seconds apart.
-    _restartNotice = Timer(const Duration(milliseconds: 600), () {
-      if (!mounted) return;
-      final context = _navigatorKey.currentContext;
-      if (context == null) {
-        // The first frame may not be up yet; try again once soon after.
-        if (attempt < 3) _notifyRestart(const [], attempt: attempt + 1);
-        return;
-      }
-      final names = _restartFor.join('、');
-      _restartFor.clear();
-      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-        SnackBar(
-          content: Text('$names已更新为新版本，请重新启动程序'),
-          duration: const Duration(seconds: 15),
-        ),
+  Future<void> _restartApp() async {
+    try {
+      // Hand over the single-instance lock before the new process starts.
+      await SingleInstance.release();
+      await Process.start(
+        Platform.resolvedExecutable,
+        const [],
+        mode: ProcessStartMode.detached,
       );
-    });
+    } on Object catch (error) {
+      AppLog.write('restart after update failed: $error');
+      return;
+    }
+    exit(0);
   }
 
   @override
   void dispose() {
-    _restartNotice?.cancel();
+    _controller.removeListener(_onControllerChanged);
     super.dispose();
   }
 
@@ -293,6 +284,13 @@ class _FreePlayerAppState extends State<FreePlayerApp> {
                       ),
                     if (!controller.immersive)
                       const Positioned.fill(child: WindowResizeHandles()),
+                    if (controller.updatingSources.isNotEmpty ||
+                        controller.restartingSoon)
+                      SourceUpdateOverlay(
+                        names: controller.updatingSources,
+                        progress: controller.updateProgress,
+                        restarting: controller.restartingSoon,
+                      ),
                   ],
                 ),
               );

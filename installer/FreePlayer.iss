@@ -11,8 +11,8 @@
 ;   scripts\assemble.ps1 -FfmpegDir D:\ffmpeg\bin
 
 #define MyAppName "Free Player"
-#define MyAppVersion "0.1.0"
-#define MyAppWinVersion "0.1.0.0"
+#define MyAppVersion "0.1.1"
+#define MyAppWinVersion "0.1.1.0"
 #define MyAppPublisher "net900"
 #define MyAppURL "https://freeplayer.8a5.cn"
 #define MyAppExeName "free_player.exe"

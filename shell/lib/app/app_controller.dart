@@ -114,6 +114,70 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ------------------------------------------------------------ source updates
+  //
+  // Launch-time updates of the core DLL and of installed local sources are
+  // visible: the app shows what is being fetched and restarts itself when the
+  // pass ends, instead of swapping files underneath a running UI.
+
+  int _updatePasses = 0;
+  final Set<String> _updating = <String>{};
+  final Set<String> _updated = <String>{};
+  CoreDownloadState? _updateProgress;
+  bool _restarting = false;
+
+  /// Names being downloaded or installed right now.
+  List<String> get updatingSources => List.unmodifiable(_updating);
+
+  /// Byte progress of the item being fetched, when the server reports a size.
+  CoreDownloadState? get updateProgress => _updateProgress;
+
+  /// Every pass is done and files changed: the shell restarts the app.
+  bool get restartingSoon => _restarting;
+
+  /// Marks a check pass (core check, local-source sweep) so an item finishing
+  /// early cannot trigger the restart while another pass is still running.
+  void beginUpdatePass() {
+    _updatePasses++;
+    notifyListeners();
+  }
+
+  void endUpdatePass() {
+    if (_updatePasses > 0) _updatePasses--;
+    _finishUpdatesIfDone();
+  }
+
+  void beginSourceUpdate(String name) {
+    _updating.add(name);
+    _updateProgress = null;
+    notifyListeners();
+  }
+
+  void reportUpdateProgress(int received, int total) {
+    _updateProgress = CoreDownloadState(received: received, total: total);
+    notifyListeners();
+  }
+
+  void endSourceUpdate(String name, {required bool updated}) {
+    _updating.remove(name);
+    if (updated) _updated.add(name);
+    if (_updating.isEmpty) _updateProgress = null;
+    _finishUpdatesIfDone();
+  }
+
+  void _finishUpdatesIfDone() {
+    if (_updatePasses > 0 || _updating.isNotEmpty) {
+      notifyListeners();
+      return;
+    }
+    if (_updated.isEmpty) {
+      notifyListeners();
+      return;
+    }
+    _restarting = true;
+    notifyListeners();
+  }
+
   /// True while the player's fullscreen button is on: the custom title bar is
   /// hidden so the video covers the whole window.
   bool get immersive => _immersive;

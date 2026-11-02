@@ -139,8 +139,9 @@ class LocalSourcesService {
   Future<String?> refreshFromUrl(
     String packageId,
     String url,
-    AppController controller,
-  ) async {
+    AppController controller, {
+    void Function()? onUpdate,
+  }) async {
     final install = _installs[packageId];
     if (install == null) return null;
     // A package whose file was deleted is repaired here as well: the install
@@ -164,6 +165,7 @@ class LocalSourcesService {
       return null;
     }
     try {
+      onUpdate?.call();
       await _installBytes(
         bytes,
         controller,

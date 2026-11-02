@@ -97,6 +97,9 @@ Future<AppServices> bootstrap() async {
   return services;
 }
 
+/// Name shown while the core DLL is being replaced at launch.
+const String coreUpdateName = '资源核心';
+
 /// Downloads the source core when the Hongguo source is installed. Called
 /// from `addGateway`, so the download belongs to the install action instead
 /// of every launch.
@@ -159,27 +162,39 @@ Future<void> removeSourceCore(AppServices services) async {
 /// again; an installed DLL is only compared by SHA-256 and replaced when the
 /// announced build differs, so a normal launch never downloads it.
 ///
-/// Returns true when the DLL on disk was replaced, so the caller can tell the
-/// user a restart picks it up.
-Future<bool> startCore(AppServices services) async {
-  if (!Platform.isWindows) return false;
-  final hasHongguo = services.controller.enabledSources
-      .any((s) => s.sourceId == coreSourceId);
-  if (!hasHongguo) return false;
+/// A replacement is visible: the shell shows the download with its progress
+/// and restarts the app once the update pass is over.
+Future<void> startCore(AppServices services) async {
+  if (!Platform.isWindows) return;
+  final controller = services.controller;
+  final hasHongguo =
+      controller.enabledSources.any((s) => s.sourceId == coreSourceId);
+  if (!hasHongguo) return;
   if (LocalCore.findLibrary() == null) {
     // Recovery, not a routine download: the source is installed but its core
     // is gone. Progress is shown because this is ~10 MB.
     await installSourceCore(services);
-    return false;
+    return;
   }
+  controller.beginUpdatePass();
+  var updating = false;
   var replaced = false;
   try {
-    await CoreDownload().ensure(onReplaced: () => replaced = true);
-    if (LocalCore.findLibrary() == null) return replaced;
+    await CoreDownload().ensure(
+      onUpdateStart: () {
+        updating = true;
+        controller.beginSourceUpdate(coreUpdateName);
+      },
+      onProgress: controller.reportUpdateProgress,
+      onReplaced: () => replaced = true,
+    );
+    if (LocalCore.findLibrary() == null) return;
     final url = await services.localCore.start();
-    if (url != null) await services.controller.attachLocalCore(url);
+    if (url != null) await controller.attachLocalCore(url);
   } on Object {
     // A failed check must never keep the app from opening.
+  } finally {
+    if (updating) controller.endSourceUpdate(coreUpdateName, updated: replaced);
+    controller.endUpdatePass();
   }
-  return replaced;
 }

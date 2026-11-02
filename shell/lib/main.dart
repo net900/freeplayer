@@ -63,8 +63,7 @@ Future<void> main(List<String> args) async {
 
   // Only the instance that actually runs the app checks and starts the core.
   // It is installed with the Hongguo source; startup only checks for updates.
-  final coreUpdated = startCore(services);
-  unawaited(coreUpdated);
+  unawaited(startCore(services));
 
   if (launchSource != null) {
     services.controller.setPendingSourceUrl(launchSource);
@@ -78,5 +77,5 @@ Future<void> main(List<String> args) async {
     await services.controller.startPreview();
   }
 
-  runApp(FreePlayerApp(services: services, coreUpdated: coreUpdated));
+  runApp(FreePlayerApp(services: services));
 }

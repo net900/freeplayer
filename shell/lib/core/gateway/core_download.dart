@@ -35,6 +35,7 @@ class CoreDownload {
   Future<String?> ensure({
     void Function(int received, int total)? onProgress,
     void Function()? onReplaced,
+    void Function()? onUpdateStart,
   }) async {
     await cleanupPendingRemoval();
     final installed = _installedPath();
@@ -52,6 +53,7 @@ class CoreDownload {
       return target;
     }
     if (_recentFailure(manifest.sha256)) return installed;
+    onUpdateStart?.call();
     final downloaded = await _download(manifest, target, onProgress);
     if (downloaded != null) {
       _writeDescriptor(manifest);
