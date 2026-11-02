@@ -13,7 +13,7 @@ const String recommendedSourcesEndpoint = String.fromEnvironment(
 /// Version reported to the update service; stamped at build time.
 const String appVersion = String.fromEnvironment(
   'FP_APP_VERSION',
-  defaultValue: '0.1.1',
+  defaultValue: '0.1.2',
 );
 
 /// The source served by the embedded core. Adding it installs the core.

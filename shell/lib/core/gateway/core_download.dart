@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 
 import '../../app/app_config.dart';
+import '../logging/app_log.dart';
 import '../storage/paths.dart';
 import 'local_core.dart';
 
@@ -54,13 +55,21 @@ class CoreDownload {
     }
     if (_recentFailure(manifest.sha256)) return installed;
     onUpdateStart?.call();
-    final downloaded = await _download(manifest, target, onProgress);
-    if (downloaded != null) {
+    final result = await _download(manifest, target, onProgress);
+    if (result.path != null) {
       _writeDescriptor(manifest);
       onReplaced?.call();
-      return downloaded;
+      return result.path;
     }
-    _writeFailure(manifest);
+    // A verified build that could not be put in place (a previous process is
+    // still letting go of the DLL after an installer relaunch) is not a bad
+    // build: retrying on the next launch beats suppressing it for half an
+    // hour, which left the stale core running against a changed protocol.
+    if (result.replaceFailed) {
+      AppLog.write('core update: could not replace the installed DLL');
+    } else {
+      _writeFailure(manifest);
+    }
     return File(target).existsSync() ? target : null;
   }
 
@@ -132,7 +141,7 @@ class CoreDownload {
     }
   }
 
-  Future<String?> _download(
+  Future<({String? path, bool replaceFailed})> _download(
     CoreManifest manifest,
     String target,
     void Function(int, int)? onProgress,
@@ -146,17 +155,46 @@ class CoreDownload {
         await _fetch(url, temp, manifest, onProgress);
         final digest = await _sha256Of(temp);
         if (digest == null || digest != manifest.sha256.toLowerCase()) {
+          AppLog.write(
+            'core update: digest mismatch '
+            '${digest ?? "null"} != ${manifest.sha256}',
+          );
           await _delete(temp);
           continue;
         }
-        if (File(target).existsSync()) await File(target).delete();
-        await temp.rename(target);
-        return target;
-      } on Object {
+        if (await _replace(temp, target)) {
+          return (path: target, replaceFailed: false);
+        }
+        await _delete(temp);
+        return (path: null, replaceFailed: true);
+      } on Object catch (error) {
+        AppLog.write('core update: download failed: $error');
         await _delete(temp);
       }
     }
-    return null;
+    return (path: null, replaceFailed: false);
+  }
+
+  /// The installer relaunches the app right after closing the previous
+  /// process, and Windows keeps the mapped DLL busy for a moment after that:
+  /// replacing it then fails with a sharing violation. A few short retries
+  /// close that window instead of leaving the old core in place.
+  Future<bool> _replace(File temp, String target) async {
+    for (var attempt = 0; attempt < 8; attempt++) {
+      try {
+        if (File(target).existsSync()) await File(target).delete();
+        await temp.rename(target);
+        return true;
+      } on FileSystemException catch (error) {
+        AppLog.write(
+          'core update: replace attempt ${attempt + 1} failed: $error',
+        );
+        await Future<void>.delayed(
+          Duration(milliseconds: 300 + attempt * 200),
+        );
+      }
+    }
+    return false;
   }
 
   Future<void> _fetch(
