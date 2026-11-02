@@ -293,25 +293,32 @@ class _DanmakuLayerState extends State<DanmakuLayer> {
 }
 
 class LoadingOverlay extends StatelessWidget {
-  const LoadingOverlay();
+  const LoadingOverlay({super.key, this.label});
+
+  /// Replaces the generic hint, e.g. while a bytevc2 episode is converted.
+  final String? label;
 
   @override
   Widget build(BuildContext context) {
-    return const ColoredBox(
-      color: Color(0x59000000),
+    return ColoredBox(
+      color: const Color(0x59000000),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            SizedBox(
+            const SizedBox(
               width: 34,
               height: 34,
               child: CircularProgressIndicator(strokeWidth: 3),
             ),
-            SizedBox(height: AppSpacing.x3),
+            const SizedBox(height: AppSpacing.x3),
             Text(
-              '加载中…',
-              style: TextStyle(color: Colors.white70, fontSize: AppFontSize.xs),
+              label ?? '加载中…',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: AppFontSize.xs,
+              ),
             ),
           ],
         ),

@@ -278,6 +278,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       '${widget.api?.sourceId ?? 'local'}:$_itemId';
   String get _cacheKey => '$_episodeId|$_quality';
 
+  /// bytevc2 (VVC) episodes have no decoder in the player: the core rebuilds
+  /// them as H.264 on first play, which takes a few seconds. Say so instead of
+  /// leaving a bare spinner that looks like a hang.
+  String? get _preparingLabel {
+    final codec = (_plan?.bestStream?.codec ?? '').toLowerCase();
+    if (codec == 'bytevc2' || codec == 'bvc2' || codec == 'vvc') {
+      return '该集为 VVC 编码，正在准备播放，请稍候…';
+    }
+    return null;
+  }
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -1952,7 +1963,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             (snapshot.error == null &&
                                 (snapshot.buffering || !opened));
                         if (!show) return const SizedBox.shrink();
-                        return const IgnorePointer(child: LoadingOverlay());
+                        return IgnorePointer(
+                          child: LoadingOverlay(label: _preparingLabel),
+                        );
                       },
                     ),
                     if (_error != null)

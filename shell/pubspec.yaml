@@ -1,7 +1,7 @@
 name: free_player
 description: 通用播放器壳 — SourceProtocol v1 客户端（不含任何源逻辑）
 publish_to: "none"
-version: 0.1.2+3
+version: 0.1.3+4
 
 environment:
   sdk: ">=3.5.0 <4.0.0"
