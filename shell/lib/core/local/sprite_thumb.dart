@@ -71,15 +71,27 @@ class RemoteSprite {
   static Future<SpriteImage?> _build(String url, String key) async {
     final jpg = File(joinPath(_dir.path, '$key.jpg'));
     if (!jpg.existsSync() || jpg.lengthSync() == 0) {
+      final bytes = await _download(url);
+      if (bytes == null) return null;
+      // Source sprites are normally JPEG (sometimes PNG). Both are already
+      // decodable: write them straight to the cache and read the dimensions
+      // from the header. Spawning ffmpeg + ffprobe for every episode was a
+      // CPU spike at exactly the moment playback starts.
+      final direct = _imageSize(bytes);
+      if (direct != null) {
+        try {
+          await jpg.writeAsBytes(bytes, flush: true);
+          return SpriteImage(jpg.path, direct.$1, direct.$2);
+        } on Object catch (error) {
+          debugPrint('remote sprite cache failed: $error');
+          return null;
+        }
+      }
       final ffmpeg = LocalThumbs.tool('ffmpeg');
       if (ffmpeg == null) return null;
       final source = File(joinPath(_dir.path, '$key.src'));
       try {
-        if (!source.existsSync() || source.lengthSync() == 0) {
-          final bytes = await _download(url);
-          if (bytes == null) return null;
-          await source.writeAsBytes(bytes, flush: true);
-        }
+        await source.writeAsBytes(bytes, flush: true);
         final result = await Process.run(ffmpeg, [
           '-y',
           '-loglevel',
@@ -109,6 +121,55 @@ class RemoteSprite {
     final size = await _size(jpg.path);
     if (size == null) return null;
     return SpriteImage(jpg.path, size.$1, size.$2);
+  }
+
+  /// Width/height from a JPEG SOF or PNG IHDR header, without decoding.
+  static (int, int)? _imageSize(List<int> bytes) {
+    if (bytes.length < 24) return null;
+    if (bytes[0] == 0xFF && bytes[1] == 0xD8) {
+      var i = 2;
+      while (i + 9 < bytes.length) {
+        if (bytes[i] != 0xFF) {
+          i++;
+          continue;
+        }
+        final marker = bytes[i + 1];
+        if (marker == 0xD8 || marker == 0xD9) {
+          i += 2;
+          continue;
+        }
+        final length = (bytes[i + 2] << 8) | bytes[i + 3];
+        if (length < 2) return null;
+        final isSof = marker >= 0xC0 &&
+            marker <= 0xCF &&
+            marker != 0xC4 &&
+            marker != 0xC8 &&
+            marker != 0xCC;
+        if (isSof) {
+          if (i + 9 > bytes.length) return null;
+          final height = (bytes[i + 5] << 8) | bytes[i + 6];
+          final width = (bytes[i + 7] << 8) | bytes[i + 8];
+          if (width > 0 && height > 0) return (width, height);
+          return null;
+        }
+        i += 2 + length;
+      }
+      return null;
+    }
+    if (bytes[0] == 0x89 &&
+        bytes[1] == 0x50 &&
+        bytes[2] == 0x4E &&
+        bytes[3] == 0x47) {
+      int be(int offset) =>
+          (bytes[offset] << 24) |
+          (bytes[offset + 1] << 16) |
+          (bytes[offset + 2] << 8) |
+          bytes[offset + 3];
+      final width = be(16);
+      final height = be(20);
+      if (width > 0 && height > 0) return (width, height);
+    }
+    return null;
   }
 
   static Future<(int, int)?> _size(String path) async {

@@ -1,15 +1,21 @@
 import 'dart:io';
 
+import '../platform/android_host.dart';
+import '../platform/platform.dart';
 import 'local_media.dart';
 
 /// Registers the app as a *candidate* video player. Windows 10/11 do not let an
 /// application silently become the default handler; the user still confirms in
 /// system settings (PRD §5.6). Everything here is user-scope (HKCU).
+///
+/// Android declares its handlers in the manifest; the settings page hides
+/// this section there.
 class FileAssociationService {
   static const String progId = 'FreePlayer.Video';
   static const String _classesRoot = r'HKCU\Software\Classes';
 
   Future<void> register() async {
+    if (!Platform.isWindows) return;
     final exe = Platform.resolvedExecutable;
     await _reg([
       'add',
@@ -46,6 +52,10 @@ class FileAssociationService {
   Future<void> openFolder(String path) async {
     final dir = Directory(path);
     if (!dir.existsSync()) dir.createSync(recursive: true);
+    if (isMobilePlatform) {
+      await AndroidHost.openFolder(dir.path);
+      return;
+    }
     try {
       if (Platform.isWindows) {
         await Process.run('explorer', [dir.path]);
@@ -60,6 +70,7 @@ class FileAssociationService {
   }
 
   Future<void> unregister() async {
+    if (!Platform.isWindows) return;
     await _reg(['delete', '$_classesRoot\\$progId', '/f'], allowFailure: true);
     for (final ext in videoExtensions) {
       await _reg(
@@ -76,6 +87,7 @@ class FileAssociationService {
   }
 
   Future<bool> isRegistered() async {
+    if (!Platform.isWindows) return false;
     final result = await Process.run(
       'reg.exe',
       ['query', '$_classesRoot\\$progId', '/ve'],
@@ -86,6 +98,7 @@ class FileAssociationService {
 
   /// Opens the Windows "Default apps" page so the user can finish the choice.
   Future<void> openSystemDefaultApps() async {
+    if (!Platform.isWindows) return;
     await Process.run(
       'cmd.exe',
       ['/c', 'start', '', 'ms-settings:defaultapps'],

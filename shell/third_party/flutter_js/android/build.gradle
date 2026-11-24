@@ -1,0 +1,44 @@
+group 'io.abner.flutter_js'
+version '1.0-SNAPSHOT'
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+apply plugin: 'com.android.library'
+
+// Flutter 3.47 / AGP 9 compiles Kotlin with the built-in Kotlin support. The
+// upstream plugin still applies KGP 1.7.20 and pins jvmTarget 1.8, which
+// conflicts with the Java 11 task and with the other plugins' Kotlin
+// versions. This vendored copy drops KGP and uses the shared toolchain.
+
+android {
+    compileSdk 36
+
+    namespace "io.abner.flutter_js"
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+        main.jniLibs.srcDirs = ['jniLibs']
+    }
+    defaultConfig {
+        minSdk 21
+        ndk {
+            abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+        }
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+    lint {
+        disable 'InvalidPackage'
+    }
+}
+
+dependencies {
+    // The QuickJS runtime ships as a JitPack AAR; the JNI bridge in
+    // src/main/kotlin/looks for its native library.
+    implementation "com.github.fast-development.android-js-runtimes:fastdev-jsruntimes-quickjs:0.3.6"
+}

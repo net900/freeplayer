@@ -156,10 +156,23 @@ bool Win32Window::Create(const std::wstring& title,
   // compositor and snaps instantly). WM_NCCALCSIZE below makes the client
   // cover the whole window, so no caption or frame is ever visible.
   const DWORD style = WS_OVERLAPPEDWINDOW;
-  const int left = Scale(origin.x, scale_factor);
-  const int top = Scale(origin.y, scale_factor);
+  int left = Scale(origin.x, scale_factor);
+  int top = Scale(origin.y, scale_factor);
   const int width = Scale(size.width, scale_factor);
   const int height = Scale(size.height, scale_factor);
+  // Start centred on the monitor the requested origin points at (the primary
+  // in practice) instead of the top-left corner. The work area keeps the
+  // window clear of the taskbar.
+  MONITORINFO monitor_info{sizeof(monitor_info)};
+  if (GetMonitorInfo(monitor, &monitor_info)) {
+    const RECT& work = monitor_info.rcWork;
+    const int work_width = work.right - work.left;
+    const int work_height = work.bottom - work.top;
+    left = work.left + (work_width - width) / 2;
+    top = work.top + (work_height - height) / 2;
+    if (left < work.left) left = work.left;
+    if (top < work.top) top = work.top;
+  }
   initial_rect_ = {left, top, left + width, top + height};
 
   HWND window = CreateWindowEx(

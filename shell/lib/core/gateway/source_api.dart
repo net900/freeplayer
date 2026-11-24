@@ -28,7 +28,14 @@ abstract class SourceApi {
 
   // Gateway extensions (PRD §9.2). Sources may answer 50100; the shell then
   // shows an unsupported state instead of failing the page.
-  Future<ItemPage> feed({String channel = '', String cursor = '', int limit = 20});
+  /// [refresh] asks the source to rebuild the first page from upstream instead
+  /// of serving its cached one (tapping the active 推荐 tab).
+  Future<ItemPage> feed({
+    String channel = '',
+    String cursor = '',
+    int limit = 20,
+    bool refresh = false,
+  });
 
   /// New three-level ranking: [type] selected_items, [sub] sub_selected_items,
   /// [panel] panel_selected_items (受众/主题), [time] background_selected_items.

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -60,6 +61,70 @@ class SkeletonBox extends StatelessWidget {
   Widget build(BuildContext context) {
     return PulseBox(width: width, height: height, radius: radius);
   }
+}
+
+/// Shows [child] only after [visible] has stayed true for [delay]. A switch
+/// that finishes in a few hundred milliseconds never flashes a spinner; a
+/// stream that is genuinely stalled still gets one.
+class DelayedVisible extends StatefulWidget {
+  const DelayedVisible({
+    super.key,
+    required this.visible,
+    required this.child,
+    this.delay = const Duration(milliseconds: 700),
+  });
+
+  final bool visible;
+  final Duration delay;
+  final Widget child;
+
+  @override
+  State<DelayedVisible> createState() => _DelayedVisibleState();
+}
+
+class _DelayedVisibleState extends State<DelayedVisible> {
+  Timer? _timer;
+  bool _shown = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.visible) _arm();
+  }
+
+  @override
+  void didUpdateWidget(DelayedVisible oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.visible == oldWidget.visible) return;
+    if (widget.visible) {
+      _arm();
+    } else {
+      _timer?.cancel();
+      _shown = false;
+    }
+  }
+
+  void _arm() {
+    _timer?.cancel();
+    if (widget.delay <= Duration.zero) {
+      _shown = true;
+      return;
+    }
+    _shown = false;
+    _timer = Timer(widget.delay, () {
+      if (mounted && widget.visible) setState(() => _shown = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      _shown ? widget.child : const SizedBox.shrink();
 }
 
 /// Five small frames rising and falling in sequence: a quiet, film-strip

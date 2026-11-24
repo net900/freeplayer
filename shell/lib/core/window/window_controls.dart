@@ -1,7 +1,14 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
+
+import '../platform/platform.dart';
 
 /// Bridge to the native runner. The window is frameless, so dragging,
 /// minimizing, maximizing and closing are driven by the Flutter title bar.
+///
+/// Android has no frameless window: the chrome is hidden there and the
+/// player's fullscreen button maps to the system UI instead.
 class WindowControls {
   static const MethodChannel _channel = MethodChannel('free_player/window');
 
@@ -9,15 +16,18 @@ class WindowControls {
   /// the cursor without feedback: the pointer's local coordinates shift as the
   /// window moves, so a Flutter-driven delta loop jitters.
   static Future<void> drag() async {
+    if (!isDesktopPlatform) return;
     await _invoke('drag');
   }
 
   /// Starts a native resize from the given edge/corner.
   static Future<void> startResize(String edge) async {
+    if (!isDesktopPlatform) return;
     await _invoke('startResize', {'edge': edge});
   }
 
   static Future<void> minimize() async {
+    if (!isDesktopPlatform) return;
     await _invoke('minimize');
   }
 
@@ -25,10 +35,12 @@ class WindowControls {
   /// A second launch hands its link over and asks for this instead of opening
   /// another window.
   static Future<void> activate() async {
+    if (!isDesktopPlatform) return;
     await _invoke('activate');
   }
 
   static Future<bool> toggleMaximize() async {
+    if (!isDesktopPlatform) return false;
     try {
       return await _channel.invokeMethod<bool>('toggleMaximize') ?? false;
     } on MissingPluginException {
@@ -39,6 +51,7 @@ class WindowControls {
   }
 
   static Future<bool> isMaximized() async {
+    if (!isDesktopPlatform) return false;
     try {
       return await _channel.invokeMethod<bool>('isMaximized') ?? false;
     } on MissingPluginException {
@@ -49,12 +62,26 @@ class WindowControls {
   }
 
   static Future<void> close() async {
+    if (isMobilePlatform) {
+      await SystemNavigator.pop();
+      return;
+    }
     await _invoke('close');
   }
 
   /// Borderless monitor-sized window for the player. The Flutter title bar is
   /// hidden by AppController.immersive at the same time.
   static Future<void> setFullscreen(bool on) async {
+    if (isMobilePlatform) {
+      try {
+        await SystemChrome.setEnabledSystemUIMode(
+          on ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+        );
+      } on Object {
+        // A platform without system UI modes ignores this.
+      }
+      return;
+    }
     try {
       await _channel.invokeMethod<bool>('setFullscreen', {'on': on});
     } on MissingPluginException {
@@ -65,6 +92,7 @@ class WindowControls {
   }
 
   static Future<void> _invoke(String method, [Object? arguments]) async {
+    if (Platform.isAndroid || Platform.isIOS) return;
     try {
       await _channel.invokeMethod<void>(method, arguments);
     } on MissingPluginException {

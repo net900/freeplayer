@@ -1,7 +1,7 @@
 name: free_player
 description: 通用播放器壳 — SourceProtocol v1 客户端（不含任何源逻辑）
 publish_to: "none"
-version: 0.1.3+4
+version: 0.1.5+6
 
 environment:
   sdk: ">=3.5.0 <4.0.0"
@@ -15,12 +15,26 @@ dependencies:
     sdk: flutter
   flutter_js: ^0.8.7
   media_kit: ^1.2.6
+  media_kit_libs_android_video: ^1.3.8
   media_kit_libs_windows_video: ^1.0.11
   media_kit_video: ^2.0.1
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+
+# Keep one fixed video texture across episodes. The stock package recreates
+# the texture whenever a stream reports a different resolution, which shows a
+# black frame on every switch. See the comment in the vendored controller.
+dependency_overrides:
+  media_kit_video:
+    path: third_party/media_kit_video
+  # Upstream 0.8.7 pins Kotlin 1.7.20 and jvmTarget 1.8, which cannot build
+  # alongside Flutter 3.47's built-in Kotlin. The vendored copy only changes
+  # its Android Gradle script.
+  flutter_js:
+    path: third_party/flutter_js
 
 flutter:
   uses-material-design: true

@@ -106,6 +106,46 @@ abstract final class LocalMedia {
 
   static bool _isDigit(int c) => c >= 0x30 && c <= 0x39;
 
+  /// A local bytevc2 file has no plan metadata saying so; the player routes
+  /// by codec, so the file itself is sniffed for the VVC configuration box.
+  static String _sniffCodec(String path) {
+    final extension = _extension(path);
+    if (extension != 'mp4' && extension != 'm4v' && extension != 'mov') {
+      return '';
+    }
+    try {
+      final file = File(path);
+      final length = file.lengthSync();
+      if (length <= 0) return '';
+      final raf = file.openSync();
+      try {
+        bool hasBox(int start, int count) {
+          if (start < 0 || count <= 0) return false;
+          raf.setPositionSync(start);
+          final bytes = raf.readSync(count);
+          final text = String.fromCharCodes(bytes);
+          return text.contains('bv2C') || text.contains('vvcC');
+        }
+
+        // moov is either faststart or at the tail; sample data in between is
+        // never needed.
+        const headBytes = 256 << 10;
+        const tailBytes = 2 << 20;
+        final head = length < headBytes ? length : headBytes;
+        if (hasBox(0, head)) return 'bytevc2';
+        if (length > head) {
+          final tailStart = length > tailBytes ? length - tailBytes : head;
+          if (hasBox(tailStart, length - tailStart)) return 'bytevc2';
+        }
+      } finally {
+        raf.closeSync();
+      }
+    } on Object {
+      // An unreadable file still reaches the player and reports its own error.
+    }
+    return '';
+  }
+
   static MediaPlan buildPlan(String path) {
     final file = File(path);
     final uri = file.absolute.uri.toString();
@@ -116,6 +156,7 @@ abstract final class LocalMedia {
         Stream(
           id: 'source',
           quality: 'source',
+          codec: _sniffCodec(path),
           url: uri,
           container: _extension(path),
           mimeType: mimeFor(path),

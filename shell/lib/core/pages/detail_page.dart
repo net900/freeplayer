@@ -90,6 +90,8 @@ class _DetailContentState extends State<DetailContent> {
   int _pendingInitial = 0;
   Map<String, int> _localPositions = const {};
   List<Item> _albumItems = const [];
+  bool _albumLoading = false;
+  bool _albumFailed = false;
   Set<String> _reservedAlbum = const {};
   List<Item> _related = const [];
   static const int _tabEpisodes = 0;
@@ -154,14 +156,52 @@ class _DetailContentState extends State<DetailContent> {
   }
 
   Future<void> _loadAlbum() async {
-    try {
-      final page = await widget.api.album(widget.item.id);
-      if (!mounted) return;
-      setState(() => _albumItems = page.items);
-      unawaited(_loadAlbumReservations());
-    } on Object {
-      // 作品系列 is optional; the tab simply stays empty.
+    if (_albumLoading) return;
+    final albumId = (widget.item.extra['album_id'] ?? '').toString();
+    final attempts =
+        albumId.isNotEmpty || widget.item.extra['multi_season'] == true
+            ? 3
+            : 2;
+    setState(() {
+      _albumLoading = true;
+      _albumFailed = false;
+    });
+    // The season lookup is the slowest request on the page and the upstream
+    // occasionally times out; retrying keeps 作品系列 from disappearing for
+    // the whole visit because of one transient failure.
+    var errored = false;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      try {
+        final page = await widget.api.album(
+          widget.item.id,
+          albumId: albumId,
+        );
+        if (!mounted) return;
+        if (page.items.isNotEmpty) {
+          setState(() {
+            _albumItems = page.items;
+            _albumLoading = false;
+          });
+          unawaited(_loadAlbumReservations());
+          return;
+        }
+      } on Object {
+        errored = true;
+      }
+      if (attempt + 1 < attempts) {
+        await Future<void>.delayed(
+          Duration(milliseconds: 400 * (attempt + 1)),
+        );
+        if (!mounted) return;
+      }
     }
+    if (!mounted) return;
+    setState(() {
+      _albumLoading = false;
+      // An empty answer is a valid "this work has no collection"; only a
+      // request failure earns the retry panel.
+      _albumFailed = errored;
+    });
   }
 
   Future<void> _loadAlbumReservations() async {
@@ -927,7 +967,7 @@ class _DetailContentState extends State<DetailContent> {
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
-              fontSize: 28,
+              fontSize: AppFontSize.display,
               height: 1.2,
               fontWeight: FontWeight.w700,
               letterSpacing: -0.4,
@@ -964,8 +1004,22 @@ class _DetailContentState extends State<DetailContent> {
         ),
         const SizedBox(height: AppSpacing.x3),
         SizedBox(
-          height: 500,
-          child: _tabBody(context, episodes),
+          // Fills short windows without forcing the old fixed 500 px box
+          // (which produced a scroll area inside a scroll page).
+          height: (MediaQuery.sizeOf(context).height - 430)
+              .clamp(320.0, 560.0)
+              .toDouble(),
+          child: AnimatedSwitcher(
+            duration: AppDuration.page,
+            switchInCurve: Curves.easeOutCubic,
+            switchOutCurve: Curves.easeInCubic,
+            transitionBuilder: (child, animation) =>
+                FadeTransition(opacity: animation, child: child),
+            child: KeyedSubtree(
+              key: ValueKey(_tab),
+              child: _tabBody(context, episodes),
+            ),
+          ),
         ),
       ],
     );
@@ -1028,6 +1082,20 @@ class _DetailContentState extends State<DetailContent> {
   }
 
   Widget _seriesView(BuildContext context) {
+    if (_albumLoading) {
+      return const Center(child: LoadingLine());
+    }
+    if (_albumItems.isEmpty && _albumFailed) {
+      return StatePanel(
+        icon: Icons.collections_bookmark_outlined,
+        title: '作品系列加载失败',
+        body: '源站暂时没有返回合集数据。',
+        action: FilledButton(
+          onPressed: _loadAlbum,
+          child: const Text('重试'),
+        ),
+      );
+    }
     if (_albumItems.isEmpty) {
       return const StatePanel(
         icon: Icons.collections_bookmark_outlined,
@@ -1074,7 +1142,7 @@ class _DetailContentState extends State<DetailContent> {
     return GridView.builder(
       padding: EdgeInsets.zero,
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 150,
+        maxCrossAxisExtent: 180,
         mainAxisSpacing: AppSpacing.x4,
         crossAxisSpacing: AppSpacing.x4,
         childAspectRatio: AppSizes.posterAspect,

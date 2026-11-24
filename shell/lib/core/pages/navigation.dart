@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../gateway/source_api.dart';
+import '../player/playback_coordinator.dart';
 import '../renderer/page_registry.dart';
 import '../sp/models.dart';
 import 'category_page.dart';
@@ -15,6 +18,9 @@ Future<void> openDetail(
   Item item, {
   String poster = '',
 }) {
+  // A detail page never shares the screen with a playing preview: pause the
+  // feed (or any mini playback) before the route covers it.
+  unawaited(PlaybackCoordinator.instance.pauseAll());
   return Navigator.of(context).push(
     instantRoute(
       (_) => OpaquePage(

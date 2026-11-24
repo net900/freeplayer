@@ -18,6 +18,8 @@ import '../local/local_media.dart';
 import '../local/local_thumbs.dart';
 import '../local/sprite_thumb.dart';
 import '../local/video_thumbs.dart';
+import '../platform/platform.dart';
+import '../player/bvc2_playback_engine.dart';
 import '../player/playback_coordinator.dart';
 import '../player/playback_engine.dart';
 import '../player/playback_pool.dart';
@@ -93,6 +95,7 @@ Future<PlayerExit?> openFullPlayer(
         episodeId: episodeId,
         initialPosition: initialPosition,
         cover: cover,
+        fullWindow: true,
       ),
     ),
   );
@@ -135,6 +138,7 @@ class PlayerScreen extends StatefulWidget {
     this.cover = '',
     this.localFiles = const [],
     this.windowToggle = false,
+    this.fullWindow = false,
   });
 
   final MediaPlan plan;
@@ -154,6 +158,10 @@ class PlayerScreen extends StatefulWidget {
   /// Shows the in-app maximize button: the sidebar player can fill the whole
   /// window without entering OS fullscreen.
   final bool windowToggle;
+
+  /// Pushed above the shell as the only page: the window chrome floats on the
+  /// video and must stay dark regardless of the page that opened it.
+  final bool fullWindow;
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -202,7 +210,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   final Map<String, ({bool liked, int likeCount})> _likeOverrides = {};
   MediaPlan? _plan;
   LocalLibrary? _library;
-  PlaybackEngine? _poolListenerEngine;
   // True from the moment a new episode starts opening until its first
   // frames arrive; the video surface is covered while it is set.
   bool _switching = false;
@@ -234,15 +241,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Timer? _hideTimer;
   Timer? _tick;
-  Timer? _speedHideTimer;
   Timer? _noticeTimer;
   Timer? _thumbsTimer;
   String? _notice;
   Item? _item;
   List<Item> _albumItems = const [];
   bool _albumLoaded = false;
+  bool _albumLoading = false;
+  int _albumToken = 0;
   bool _controlsVisible = true;
   bool _loading = true;
+  // True once this player has shown a frame. Repeat episode switches keep the
+  // old picture instead of dropping a full-screen cover and spinner; only the
+  // first open and a different work need the curtain.
+  bool _hadFrame = false;
+  // Timestamp of an episode open, so the switch-to-picture delay is visible
+  // in logcat while tuning the decrypt proxy and player startup.
+  DateTime? _switchStartedAt;
   bool _resumed = false;
   String? _error;
   // A quality switch keeps the previous plan until the new stream proves it
@@ -261,10 +276,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   int _danmakuWindow = -1;
   int _lastDanmakuLoadMs = 0;
   bool _advancing = false;
+  bool _completedNoticeShown = false;
   bool _fullscreen = false;
   LocalWindowMode? _windowMode;
   bool _windowMaximized = false;
-  bool _speedHover = false;
   double _lastVolume = 1;
   AppController? _appController;
   String _episodeLabel = '';
@@ -282,7 +297,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// them as H.264 on first play, which takes a few seconds. Say so instead of
   /// leaving a bare spinner that looks like a hang.
   String? get _preparingLabel {
-    final codec = (_plan?.bestStream?.codec ?? '').toLowerCase();
+    final plan = _plan;
+    if (plan?.bestStream?.extra['rebuild'] == 'h264') {
+      return '正在准备 H.264 副本，请稍候…';
+    }
+    final codec = (plan?.bestStream?.codec ?? '').toLowerCase();
     if (codec == 'bytevc2' || codec == 'bvc2' || codec == 'vvc') {
       return '该集为 VVC 编码，正在准备播放，请稍候…';
     }
@@ -450,17 +469,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     _quality = _plan?.bestStream?.quality ?? '';
     _storePlan(_cacheKey, _plan!);
-    _pool.onActiveChanged = (engine) {
-      _poolListenerEngine?.snapshot.removeListener(_onSnapshot);
-      _poolListenerEngine = engine;
-      engine.snapshot.addListener(_onSnapshot);
-    };
-    _poolListenerEngine = _engine;
     _engine.snapshot.addListener(_onSnapshot);
+    // Prepare the next two episodes before the current one starts: a viewer
+    // can hit "next" immediately, and the playlist then already has the
+    // prefetched media.
+    _prefetchNext(2);
+    _switchStartedAt = DateTime.now();
     _start();
     _prefetchSprites();
     _scheduleHide();
-    _tick = Timer.periodic(const Duration(seconds: 5), (_) {
+    // Local persistence is not a per-second concern: pausing, switching and
+    // closing all save explicitly. A slower tick also stops the two library
+    // mutations from competing with playback.
+    _tick = Timer.periodic(const Duration(seconds: 15), (_) {
       _saveProgress();
       _retryDanmakuIfNeeded();
     });
@@ -468,6 +489,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   void _onSnapshot() {
     final snapshot = _engine.snapshot.value;
+    if (!_hadFrame && _engine.position.value > Duration.zero) {
+      setState(() => _hadFrame = true);
+    }
+    final switchStarted = _switchStartedAt;
+    final position = _engine.position.value;
+    if (switchStarted != null &&
+        snapshot.playing &&
+        position > Duration.zero &&
+        position < const Duration(seconds: 5)) {
+      _switchStartedAt = null;
+      debugPrint(
+        'player switch: first frame in '
+        '${DateTime.now().difference(switchStarted).inMilliseconds} ms '
+        '($_episodeLabel)',
+      );
+    }
+    if (!snapshot.completed) _completedNoticeShown = false;
     // The engine reports a dead stream here, not through the open() future.
     // Without this the player sat on a black frame with no message at all.
     final engineError = snapshot.error;
@@ -485,13 +523,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
       });
       return;
     }
-    if (_switching && snapshot.ready && snapshot.position > Duration.zero) {
+    // A playlist switch does not re-open the engine, so `ready` can stay
+    // false while the new episode is already playing. The moving playhead is
+    // the real proof that the switch landed; keeping `_switching` true here
+    // made every later `completed` event get ignored, so auto-play-next
+    // silently stopped after the first manual episode switch.
+    if (_switching && _engine.position.value > Duration.zero) {
       _switchWatchdog?.cancel();
       _revertTo = null;
       setState(() => _switching = false);
       // Neighbour prefetch is deliberately deferred while a switch is in
       // flight; run it once the new episode actually has frames.
       _prefetchNext(3);
+      // This tick still carries the previous item's completed flag on a
+      // playlist switch; ignore it instead of advancing a second time.
+      return;
     }
     if (!_danmakuTimedToDuration && snapshot.duration.inSeconds > 30) {
       // The first danmaku fetch happens before the container reports its
@@ -502,37 +548,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!_danmakuNeedsLogin && snapshot.duration > Duration.zero) {
       // Danmaku is served in 30s windows: follow the playhead so lines from
       // the current minute actually arrive.
-      final window = snapshot.position.inSeconds ~/ 30;
+      final window = _engine.position.value.inSeconds ~/ 30;
       final now = DateTime.now().millisecondsSinceEpoch;
       if (window != _danmakuWindow && now - _lastDanmakuLoadMs > 2000) {
         _lastDanmakuLoadMs = now;
         _loadDanmaku();
       }
     }
-    if (!snapshot.completed || _advancing) return;
+    // A playlist switch can still report the previous item's completed flag
+    // for a frame; never treat that as a second end-of-episode.
+    if (!snapshot.completed || _advancing || _switching) return;
     final index = _episodes.indexWhere((episode) => episode.id == _episodeId);
     if (index < 0 || index + 1 >= _episodes.length) return;
-    // Watched to the end: the next visit starts this episode over.
-    _clearEpisodePosition(_episodes[index].id);
+    // Watched to the end: [_saveProgress] stores it as finished with a zero
+    // resume position, so selecting it again starts from the beginning.
     if (!AppScope.controllerOf(context).settings.autoPlayNext) {
-      _showNotice('本集已播完');
+      if (!_completedNoticeShown) {
+        _completedNoticeShown = true;
+        _showNotice('本集已播完');
+      }
       return;
     }
     _advancing = true;
     _stepEpisode(1).whenComplete(() => _advancing = false);
-  }
-
-  void _clearEpisodePosition(String episodeId) {
-    final library = _library;
-    if (library == null) return;
-    unawaited(
-      library.recordEpisodePosition(
-        _seriesKey,
-        episodeId,
-        positionSec: 0,
-        durationSec: 0,
-      ),
-    );
   }
 
   /// Speed is global: every open (first episode, next episode, quality switch)
@@ -639,12 +677,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void dispose() {
     _hideTimer?.cancel();
     _tick?.cancel();
-    _speedHideTimer?.cancel();
     _noticeTimer?.cancel();
     _switchWatchdog?.cancel();
     _thumbsTimer?.cancel();
     _volumeSaveTimer?.cancel();
-    _poolListenerEngine?.snapshot.removeListener(_onSnapshot);
     _engine.snapshot.removeListener(_onSnapshot);
     _saveProgress();
     if (_fullscreen) {
@@ -699,12 +735,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     try {
       // The per-episode map is the most precise: it exists even when the user
       // jumped between episodes inside the player.
-      var seconds = await library.episodePosition(_seriesKey, episodeId);
+      var seconds = await library.episodeResumePosition(_seriesKey, episodeId);
       if (seconds < 5) {
         final history = await library.history();
         for (final row in history) {
           if (row.seriesKey != _seriesKey) continue;
           if (row.episodeId.isNotEmpty && row.episodeId != episodeId) break;
+          // A finished work has no resume point even if an older build
+          // stored its end position in the history row.
+          if (row.finished ||
+              (row.durationSec > 0 &&
+                  row.positionSec >= row.durationSec - 5)) {
+            break;
+          }
           seconds = row.positionSec;
           break;
         }
@@ -725,7 +768,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final library = _library;
     if (library == null || episodeId.isEmpty) return;
     try {
-      final seconds = await library.episodePosition(_seriesKey, episodeId);
+      final seconds =
+          await library.episodeResumePosition(_seriesKey, episodeId);
       if (seconds < 5 || !mounted) return;
       final target = Duration(seconds: seconds);
       await _seekWhenReady(target);
@@ -744,34 +788,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (snapshot.duration <= Duration.zero) return;
     final index = _episodes.indexWhere((episode) => episode.id == _episodeId);
     final completed = snapshot.completed;
-    final position = completed ? snapshot.duration : snapshot.position;
+    final position = completed ? snapshot.duration : _engine.position.value;
     // A freshly opened episode starts at zero; without this guard the first
     // tick would replace a real position from an earlier session with 0s.
     if (!completed && position.inSeconds < 5) return;
     try {
-      await library.recordProgress(
-            LibraryRecord(
-              seriesKey: _seriesKey,
-              title: _title,
-              cover: _cover.isNotEmpty
-                  ? _cover
-                  : (_item?.cover ?? ''),
-              sourceId: api?.sourceId ?? 'local',
-              itemId: _itemId,
-              episodeId: _episodeId,
-              episodeIndex: index >= 0 ? _episodes[index].index : 0,
-              positionSec: position.inSeconds,
-              durationSec: snapshot.duration.inSeconds,
-              updatedAt: DateTime.now().toIso8601String(),
-              episodeCount: _episodes.length,
-              finished: completed,
-            ),
-          );
-      await library.recordEpisodePosition(
-        _seriesKey,
-        _episodeId,
-        positionSec: position.inSeconds,
-        durationSec: snapshot.duration.inSeconds,
+      await library.recordPlayback(
+        LibraryRecord(
+          seriesKey: _seriesKey,
+          title: _title,
+          cover: _cover.isNotEmpty ? _cover : (_item?.cover ?? ''),
+          sourceId: api?.sourceId ?? 'local',
+          itemId: _itemId,
+          episodeId: _episodeId,
+          episodeIndex: index >= 0 ? _episodes[index].index : 0,
+          positionSec: position.inSeconds,
+          durationSec: snapshot.duration.inSeconds,
+          updatedAt: DateTime.now().toIso8601String(),
+          episodeCount: _episodes.length,
+          finished: completed,
+        ),
+        // A finished episode stays marked as watched, but never as a resume
+        // point: writing the end position here made selecting it seek to the
+        // last three seconds and immediately auto-advance again.
+        resumePositionSec: completed ? 0 : position.inSeconds,
+        resumeDurationSec: snapshot.duration.inSeconds,
+        completed: completed,
       );
       if (position.inSeconds > 5 && !_watchedIds.contains(_episodeId)) {
         setState(() => _watchedIds = {..._watchedIds, _episodeId});
@@ -828,6 +870,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final item = await api.detail(_itemId);
       if (!mounted) return;
       setState(() => _item = item);
+      // The first album lookup runs before the detail payload (and its
+      // album_id) is known. Retry with the id now, so a slow detail response
+      // does not leave 作品系列 empty.
+      if (_albumItems.isEmpty && !_albumLoaded) unawaited(_loadAlbum());
     } on Object {
       // The hover card is optional.
     }
@@ -837,14 +883,40 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// waiting for /detail first would only add to that.
   Future<void> _loadAlbum() async {
     final api = widget.api;
-    if (api == null || _itemId.isEmpty || _albumLoaded) return;
-    _albumLoaded = true;
+    if (api == null || _itemId.isEmpty || _albumLoaded || _albumLoading) return;
+    _albumLoading = true;
+    final token = ++_albumToken;
+    final albumId = (_item?.extra['album_id'] ?? '').toString();
+    // The upstream season lookup can time out once and still succeed on the
+    // next call. One failed request used to hide 作品系列 for the whole
+    // session, which is why the tab appeared only sometimes.
+    final attempts =
+        albumId.isNotEmpty || _item?.extra['multi_season'] == true ? 3 : 2;
     try {
-      final page = await api.album(_itemId);
-      if (!mounted) return;
-      setState(() => _albumItems = page.items);
-    } on Object {
-      // No series data: the entry stays hidden.
+      for (var attempt = 0; attempt < attempts; attempt++) {
+        try {
+          final page = await api.album(_itemId, albumId: albumId);
+          if (!mounted || token != _albumToken) return;
+          if (page.items.isNotEmpty) {
+            setState(() => _albumItems = page.items);
+            _albumLoaded = true;
+            return;
+          }
+        } on Object {
+          // Retry below; a permanent absence simply leaves the entry hidden.
+        }
+        if (attempt + 1 < attempts) {
+          await Future<void>.delayed(
+            Duration(milliseconds: 400 * (attempt + 1)),
+          );
+          if (!mounted) return;
+        }
+      }
+      // Allow a later _loadInfo to retry with the album id from the detail
+      // payload instead of keeping the feature hidden forever.
+      _albumLoaded = false;
+    } finally {
+      if (token == _albumToken) _albumLoading = false;
     }
   }
 
@@ -965,10 +1037,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _showNotice('《${item.title}》还没有上线');
       return;
     }
+    // Do not let the previous work's prefetch queue delay the new one.
+    _prefetchToken++;
     await _saveProgress();
     if (!mounted) return;
     setState(() {
       _loading = true;
+      // A different work has different artwork; do not keep the previous
+      // drama's last frame under it.
+      _hadFrame = false;
       _error = null;
     });
     try {
@@ -1001,8 +1078,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               PlayRequest(
                 itemId: item.id,
                 episodeId: first.id,
-                quality:
-                    savedQuality.isEmpty ? 'auto' : savedQuality,
+                quality: savedQuality.isEmpty ? 'auto' : savedQuality,
               ),
             );
       if (!mounted) return;
@@ -1029,6 +1105,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _storePlan('$_episodeId|$_quality', plan);
         _albumItems = const [];
         _albumLoaded = false;
+        _albumLoading = false;
+        _albumToken++;
         _watchedIds = <String>{};
         _watchedLoaded = true;
         _danmaku = const [];
@@ -1064,10 +1142,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _switchWatchdog = Timer(const Duration(seconds: 20), () {
       if (!mounted) return;
       final snapshot = _engine.snapshot.value;
-      if (snapshot.position > Duration.zero) return;
+      final position = _engine.position.value;
+      if (position > Duration.zero) return;
       if (snapshot.error != null) return;
       debugPrint(
-        'player watchdog: pos=${snapshot.position.inMilliseconds}ms '
+        'player watchdog: pos=${position.inMilliseconds}ms '
         'dur=${snapshot.duration.inMilliseconds}ms '
         'buffering=${snapshot.buffering} err=${snapshot.error} '
         'source=${widget.api?.sourceId ?? '-'} '
@@ -1097,7 +1176,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (api == null || _episodeId.isEmpty) return;
     // A retry replaces the stream, not the place in it: a line that died at
     // 12:30 must not come back at 0:00.
-    final resumeAt = _engine.snapshot.value.position;
+    final resumeAt = _engine.position.value;
     setState(() {
       _error = null;
       _loading = true;
@@ -1158,6 +1237,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// Sampling a strip costs ffmpeg a probe plus one seek per tile. Doing it
   /// at the moment of a switch competes with the new stream for CPU and
   /// sockets, which reads as a stutter; wait for playback to settle.
+  /// Preview strips are parked for now: building one decodes the episode once
+  /// per tile, and a VVC episode has no hardware decoder, so the strip cost
+  /// more than the playback. Flip back to true to restore them.
+  static const bool _thumbnailsEnabled = false;
+
+  /// VVC has no hardware decoder here, so sampling one preview frame per tile
+  /// means decoding VVC twenty times while the episode plays — that is what
+  /// pinned the CPU. Those episodes get no preview strip and never run ffmpeg.
+  static bool _isVvcCodec(String? codec) {
+    switch ((codec ?? '').toLowerCase()) {
+      case 'bytevc2':
+      case 'bvc2':
+      case 'vvc':
+        return true;
+    }
+    return false;
+  }
+
   void _deferThumbs(MediaPlan plan) {
     _thumbsTimer?.cancel();
     _thumbsTimer = Timer(const Duration(seconds: 4), () {
@@ -1167,10 +1264,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _loadGeneratedThumbs(MediaPlan plan) {
+    if (!_thumbnailsEnabled) return;
     // A declared or plain sprite address is already the source's own artwork.
     if (plan.thumbs != null || plan.spriteUrl != null) return;
     final stream = plan.bestStream;
     if (stream == null || stream.url.isEmpty) return;
+    if (_isVvcCodec(stream.codec)) return;
     final key = VideoThumbs.keyFor(stream.url);
     final known = VideoThumbs.cached(key);
     if (known != null) {
@@ -1203,6 +1302,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// Downloaded/open local files have no source sprite; ffmpeg builds one
   /// and the seek bar picks it up when ready.
   void _loadLocalThumbs(String path) {
+    if (!_thumbnailsEnabled) return;
+    if (_isVvcCodec(_plan?.bestStream?.codec)) return;
     final cached = LocalThumbs.cached(path);
     _localThumbs = cached;
     if (cached != null) return;
@@ -1216,6 +1317,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     String episodeId, {
     String? quality,
     bool cache = true,
+    bool skipWarm = false,
   }) async {
     final q = quality ?? _quality;
     final key = '$episodeId|$q';
@@ -1235,6 +1337,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         itemId: _itemId,
         episodeId: episodeId,
         quality: q.isEmpty ? 'auto' : q,
+        skipWarm: skipWarm,
       ),
     );
     // A preview-only lookup must not pin a short-lived plan (stream URLs and
@@ -1275,11 +1378,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
     var cursor = 0;
     var failures = 0;
     Future<void> worker() async {
+      // The first picture must win the CPU: converting a sprite while the
+      // decoder is opening the stream is perceived as a stutter. After the
+      // plan warm-up chain has started, `_planFor` below hits its cache and
+      // does not kick a second gateway preparation job.
+      await Future<void>.delayed(const Duration(seconds: 10));
       while (cursor < queue.length) {
         if (!mounted || token != _spriteToken) return;
         final id = queue[cursor++];
         try {
-          final plan = await _planFor(id, cache: false);
+          // The neighbor plan is cached by _prefetchNext; reuse it instead of
+          // issuing a second /play that would warm the same episode again.
+          final plan = await _planFor(id, skipWarm: true);
           failures = 0;
           final url = plan.spriteUrl;
           if (url != null &&
@@ -1301,47 +1411,86 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
     }
 
-    for (var i = 0; i < 2; i++) {
-      unawaited(worker());
-    }
+    unawaited(worker());
   }
 
   /// Resolves the next episodes in the background; the gateway warms their
   /// media index in the same call. Only the immediate next one is opened in a
   /// spare engine, and only after the current episode settled: preloading two
   /// more streams at the instant of a switch is what made the switch stutter.
+  int _prefetchToken = 0;
+
+  /// Warms the next episodes' plans in order. The gateway starts preparing a
+  /// bytevc2 episode on every `/play` (H.264 rebuild or lossless VVC remux), so
+  /// sequential requests put the nearest episode into that queue first instead
+  /// of leaving the order to a burst of parallel calls.
+  ///
+  /// No spare player is opened — the single engine opens the stream when the
+  /// switch actually happens. This is what prepares episode 3 while episode 1
+  /// is still playing.
   void _prefetchNext(int count) {
     if (_episodes.isEmpty) return;
     final index = _episodes.indexWhere((episode) => episode.id == _episodeId);
     if (index < 0) return;
-    for (var i = index + 1; i <= index + count && i < _episodes.length; i++) {
-      final id = _episodes[i].id;
-      final near = i == index + 1;
-      final cached = _cachedPlan('$id|$_quality');
-      if (cached != null) {
-        if (near && widget.api != null && !_switching) {
-          unawaited(_preloadSoon(id, cached));
+    final controller = AppScope.controllerOf(context);
+    // A local core prepares the next two episodes: one for auto-play, one so
+    // a quick "next, next" still has media ready. A remote gateway may warm
+    // the full configured window.
+    final limit =
+        controller.activeSourceRunsLocally ? (count < 2 ? count : 2) : count;
+    final token = ++_prefetchToken;
+    final episodes = _episodes;
+    final quality = _quality;
+    unawaited(() async {
+      // Start almost immediately: switching right after an episode opens must
+      // also find a queued entry. A short pause keeps it behind the first
+      // frame's own request.
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      for (var i = index + 1; i <= index + limit && i < episodes.length; i++) {
+        if (!mounted || token != _prefetchToken || quality != _quality) return;
+        final id = episodes[i].id;
+        if (!_warming.add(id)) continue;
+        try {
+          // The next two episodes get their media prepared; the rest only
+          // need a plan.
+          final plan = await _planFor(id, skipWarm: i > index + 2);
+          _warmProxy(plan);
+          if (i == index + 1 && mounted && token == _prefetchToken) {
+            // Put it in the player's own playlist: libmpv prefetches this
+            // entry, so the switch does not rebuild the video output.
+            await _engine.queueNext(plan);
+          }
+        } on Object {
+          // Leave the next run free to retry this episode.
+        } finally {
+          _warming.remove(id);
         }
-        continue;
+        // Space the jobs out: the gateway prepares one bytevc2 episode at a
+        // time, and gaps keep the one on screen ahead of the queue.
+        await Future<void>.delayed(const Duration(seconds: 3));
       }
-      if (!_warming.add(id)) continue;
-      _planFor(id).then((plan) {
-        // The rest are warmed at the gateway by the plan call itself.
-        if (near && widget.api != null && !_switching) {
-          unawaited(_preloadSoon(id, plan));
-        }
-      }).catchError((Object _) {
-        _warming.remove(id);
-      });
-    }
+    }());
   }
 
-  /// Opens the next episode in a spare engine, but only once the one on
-  /// screen has had a moment to start.
-  Future<void> _preloadSoon(String id, MediaPlan plan) async {
-    await Future<void>.delayed(const Duration(milliseconds: 1500));
-    if (!mounted || _switching) return;
-    await _pool.preload(id, plan);
+  /// Builds the decryption proxy for an episode that is only queued: opening
+  /// it does a size probe and fetches the moov window from the CDN, and doing
+  /// that while the current episode plays removes it from the switch.
+  void _warmProxy(MediaPlan plan) {
+    final stream = plan.bestStream;
+    if (stream == null || stream.url.isEmpty) return;
+    // VVC decrypts inside the player process; only the mpv path needs the
+    // loopback proxy warmed.
+    if (Bvc2PlaybackEngine.handlesPlan(plan)) {
+      Bvc2PlaybackEngine.warm(plan);
+      return;
+    }
+    final decryption = stream.decryption ?? plan.decryption;
+    if (!decryption.required ||
+        decryption.location != 'client' ||
+        decryption.keyHex.isEmpty) {
+      return;
+    }
+    DecryptProxy.warm(stream.url, decryption.keyHex);
   }
 
   Future<void> _playEpisode(Episode episode) async {
@@ -1349,6 +1498,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // Rapid scrolling can start a second switch while the first is still
     // fetching; only the latest one may touch the engine or the page state.
     final token = ++_episodeToken;
+    _switchStartedAt = DateTime.now();
+    // The old chain would otherwise keep warming the episode we just left.
+    _prefetchToken++;
     _autoRetried = false;
     await _saveProgress();
     if (!mounted || token != _episodeToken) return;
@@ -1381,12 +1533,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _revertTo = null;
       _switching = true;
       _armWatchdog();
-      final adopted = await _pool.adopt(episode.id);
+      // The next episode is normally already in libmpv's playlist. Advancing
+      // there keeps the video output alive and plays the prefetched file.
+      final queuedId = plan.episodeId.isNotEmpty ? plan.episodeId : episode.id;
+      var advanced = localPath == null &&
+          await _engine.playQueuedNext(queuedId);
       if (!mounted || token != _episodeToken) return;
-      if (!adopted) {
-        await _pool.openActive(episode.id, plan);
-        await _engine.play();
+      if (!advanced && localPath == null) {
+        // Switching immediately after playback starts means the prefetcher
+        // has not queued this episode yet. Append it now and jump inside the
+        // playlist anyway: open() clears the video output, which is exactly
+        // the black frame the viewer sees in this case.
+        await _engine.queueNext(plan);
+        advanced = await _engine.playQueuedNext(queuedId);
         if (!mounted || token != _episodeToken) return;
+      }
+      if (!advanced) {
+        final adopted = await _pool.adopt(episode.id);
+        if (!mounted || token != _episodeToken) return;
+        if (!adopted) {
+          await _pool.openActive(episode.id, plan);
+          await _engine.play();
+          if (!mounted || token != _episodeToken) return;
+        }
       }
       if (_engine.snapshot.value.error != null && !_autoRetried) {
         _autoRetried = true;
@@ -1438,7 +1607,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     try {
       final snapshot = _engine.snapshot.value;
       final duration = snapshot.duration.inSeconds;
-      final offset = snapshot.position.inSeconds;
+      final offset = _engine.position.value.inSeconds;
       final page = await api.danmaku(
         itemId: _itemId,
         episodeId: episodeId,
@@ -1535,7 +1704,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       api: api,
       itemId: _itemId,
       episodeId: _episodeId,
-      positionSec: _engine.snapshot.value.position.inSeconds,
+      positionSec: _engine.position.value.inSeconds,
       durationSec: _engine.snapshot.value.duration.inSeconds,
       lines: _danmaku,
       onChanged: _loadDanmaku,
@@ -1575,12 +1744,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
         expiresAt: plan.expiresAt,
         nextEpisodeId: plan.nextEpisodeId,
         downgraded: plan.downgraded,
+        durationMs: plan.durationMs,
         extra: plan.extra,
       );
       // Preparing the plan takes seconds and the picture keeps playing: read
       // the live state again so the new stream resumes where it actually is,
       // not where it was when the quality sheet was opened.
-      final resumeAt = _engine.snapshot.value.position;
+      final resumeAt = _engine.position.value;
       final wasPlaying = _engine.snapshot.value.playing;
       // Lines die without notice: hold the previous plan until the new stream
       // shows a frame, so a dead line cannot end playback.
@@ -1697,45 +1867,51 @@ class _PlayerScreenState extends State<PlayerScreen> {
         decoration: BoxDecoration(
           // Flat fill over the video: a backdrop blur here had to be
           // recomputed on every frame while the picture was playing.
-          color: Colors.black.withValues(alpha: 0.66),
-              borderRadius: BorderRadius.circular(AppRadius.md),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.16),
-              ),
-            ),
+          color: tokens.colors.glassStrong,
+          borderRadius: BorderRadius.circular(AppRadius.md),
+          border: Border.all(color: tokens.colors.glassStrongBorder),
+        ),
             child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(
+            Icon(
               Icons.downloading,
               size: 18,
-              color: Colors.white70,
+              color: tokens.colors.text2,
             ),
             const SizedBox(width: AppSpacing.x2),
             Text(
               '已加入下载 · $_downloadQueued 集',
-              style: const TextStyle(color: Colors.white, fontSize: 13),
+              style: TextStyle(
+                color: tokens.colors.text,
+                fontSize: AppFontSize.body,
+              ),
             ),
             const SizedBox(width: AppSpacing.x2),
             Text(
               '查看',
               style: TextStyle(
                 color: tokens.colors.accent,
-                fontSize: 13,
+                fontSize: AppFontSize.body,
                 fontWeight: FontWeight.w600,
               ),
             ),
             const SizedBox(width: 2),
-              IconButton(
-                onPressed: () {
-                  _downloadNoticeTimer?.cancel();
-                  setState(() => _downloadQueued = 0);
-                },
-                padding: EdgeInsets.zero,
-                constraints:
-                    const BoxConstraints.tightFor(width: 26, height: 26),
-                icon: const Icon(Icons.close, size: 14, color: Colors.white54),
+            IconButton(
+              tooltip: '关闭',
+              onPressed: () {
+                _downloadNoticeTimer?.cancel();
+                setState(() => _downloadQueued = 0);
+              },
+              padding: EdgeInsets.zero,
+              constraints:
+                  const BoxConstraints.tightFor(width: 26, height: 26),
+              icon: Icon(
+                Icons.close,
+                size: 14,
+                color: tokens.colors.text3,
               ),
+            ),
             ],
           ),
         ),
@@ -1779,8 +1955,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _seekBy(int seconds) async {
-    final snapshot = _engine.snapshot.value;
-    final next = snapshot.position + Duration(seconds: seconds);
+    final next = _engine.position.value + Duration(seconds: seconds);
     await _engine.seek(next < Duration.zero ? Duration.zero : next);
   }
 
@@ -1811,8 +1986,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (current > 0.001) {
       _lastVolume = current;
       _setVolume(0);
+      _showNotice('已静音');
     } else {
       _setVolume(_lastVolume <= 0.001 ? 1 : _lastVolume);
+      _showNotice('已取消静音');
     }
   }
 
@@ -1851,11 +2028,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.arrowLeft) {
-      _seekBy(-5);
+      _seekBy(-10);
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.arrowRight) {
-      _seekBy(5);
+      _seekBy(10);
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.arrowUp) {
@@ -1864,6 +2041,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     if (key == LogicalKeyboardKey.arrowDown) {
       _changeVolume(-0.05);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.keyM) {
+      _toggleMute();
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.keyF) {
@@ -1887,10 +2068,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final tokens = AppTokens.of(context);
     return PageTitleBinding(
       title: _episodeLabel.isEmpty
           ? _title
           : '${_title} · $_episodeLabel',
+      overVideo: widget.fullWindow,
       child: Scaffold(
         backgroundColor: Colors.black,
         body: Focus(
@@ -1905,10 +2088,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: _togglePlay,
-                onDoubleTap: () {
-                  final position = _engine.snapshot.value.position;
-                  _engine.seek(position + const Duration(seconds: 10));
+                // On phones the feed switches episodes by swiping up/down;
+                // the full player follows the same convention.
+                onVerticalDragEnd: (details) {
+                  if (!isMobilePlatform) return;
+                  final velocity = details.primaryVelocity ?? 0;
+                  if (velocity < -200) {
+                    _stepEpisode(1);
+                  } else if (velocity > 200) {
+                    _stepEpisode(-1);
+                  }
                 },
+                // Desktop players use double-click for fullscreen; ±10 s is
+                // on explicit buttons and the arrow keys instead.
+                onDoubleTap: () {
+                  _toggleFullscreen();
+                },
+                onSecondaryTapUp: (details) =>
+                    _showVideoMenu(details.globalPosition),
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
@@ -1917,20 +2114,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     // a dead screen.
                     if (_cover.isNotEmpty)
                       Positioned.fill(
-                        child: CoverImage(
-                          url: _cover,
-                          seed: _title,
-                          fit: BoxFit.cover,
-                          decodeWidth: 240,
-                          blurSigma: 26,
+                        child: ListenableBuilder(
+                          listenable: Listenable.merge(
+                            [_engine.snapshot, _engine.position],
+                          ),
+                          builder: (context, child) {
+                            // A full-screen 26px blur behind the video is
+                            // re-composited with every frame; once a picture is
+                            // on screen the artwork adds nothing but cost.
+                            final snapshot = _engine.snapshot.value;
+                            final covered = snapshot.ready &&
+                                (snapshot.playing ||
+                                    _engine.position.value > Duration.zero);
+                            if (covered) return const SizedBox.shrink();
+                            return child!;
+                          },
+                          child: CoverImage(
+                            url: _cover,
+                            seed: _title,
+                            fit: BoxFit.cover,
+                            decodeWidth: 240,
+                            blurSigma: 26,
+                          ),
                         ),
                       ),
-                    _engine.buildSurface(context),
-                    // While a new episode is opening, the engine still holds
-                    // the previous frame. Cover it with the artwork and a
-                    // loading mark instead of letting a stale picture sit
-                    // there for seconds.
-                    if (_switching || _loading)
+                    // The video texture is its own layer: control fades and
+                    // danmaku repaints do not force the picture to repaint.
+                    RepaintBoundary(child: _engine.buildSurface(context)),
+                    // Only the first frame (or a different work) needs the
+                    // full cover. Switching episodes keeps the previous
+                    // picture until the new one paints, which is what makes
+                    // the hand-off feel continuous.
+                    if ((_switching || _loading) && !_hadFrame)
                       Positioned.fill(
                         child: _SwitchCurtain(cover: _cover, title: _title),
                       ),
@@ -1940,31 +2155,42 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         builder: (context, _) {
                           final style =
                               AppScope.controllerOf(context).settings;
-                          return DanmakuLayer(
-                            engine: _engine,
-                            lines: _danmaku,
-                            api: widget.api!,
-                            itemId: _itemId,
-                            episodeId: _episodeId,
-                            onChanged: _loadDanmaku,
-                            fontSize: style.danmakuFontSize,
-                            opacity: style.danmakuOpacity,
-                            speed: style.danmakuSpeed,
+                          return RepaintBoundary(
+                            child: DanmakuLayer(
+                              engine: _engine,
+                              lines: _danmaku,
+                              api: widget.api!,
+                              itemId: _itemId,
+                              episodeId: _episodeId,
+                              onChanged: _loadDanmaku,
+                              fontSize: style.danmakuFontSize,
+                              opacity: style.danmakuOpacity,
+                              speed: style.danmakuSpeed,
+                            ),
                           );
                         },
                       ),
                     ValueListenableBuilder<PlaybackSnapshot>(
                       valueListenable: _engine.snapshot,
                       builder: (context, snapshot, _) {
-                        // No duration yet means the media never opened: show
-                        // a spinner instead of a silent black frame.
-                        final opened = snapshot.duration > Duration.zero;
+                        // A growing remuxed stream can report no duration even
+                        // after frames are on screen. A moving playhead or a
+                        // painted frame proves playback started, so do not
+                        // leave the spinner over a playing picture just
+                        // because `duration` is still zero.
+                        final hasPicture = _hadFrame ||
+                            _engine.position.value > Duration.zero;
                         final show = _loading ||
-                            (snapshot.error == null &&
-                                (snapshot.buffering || !opened));
+                            (snapshot.error == null && !hasPicture);
                         if (!show) return const SizedBox.shrink();
                         return IgnorePointer(
-                          child: LoadingOverlay(label: _preparingLabel),
+                          child: DelayedVisible(
+                            visible: show,
+                            delay: _hadFrame
+                                ? const Duration(milliseconds: 800)
+                                : Duration.zero,
+                            child: LoadingOverlay(label: _preparingLabel),
+                          ),
                         );
                       },
                     ),
@@ -1974,10 +2200,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         onBack: () => Navigator.of(context).maybePop(),
                         onRetry: _retryCurrent,
                       ),
-                    // Back button: the only chrome besides the controls.
+                    // Back button: the only chrome besides the controls. In
+                    // whole-window local playback the transparent title bar
+                    // floats above the player, so clear its drag strip.
                     Positioned(
                       left: AppSpacing.x2,
-                      top: AppSpacing.x2,
+                      top: AppSpacing.x2 +
+                          (_windowMaximized ? AppSizes.titleBar : 0),
                       child: SafeArea(
                         child: AnimatedOpacity(
                           opacity: _controlsVisible ? 1 : 0,
@@ -1992,146 +2221,121 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         ),
                       ),
                     ),
-                    // Resume notice: frosted, top-centre, never over the
-                    // progress bar or the controls.
-                    if (_downloadQueued > 0)
-                      Positioned(
-                        right: AppSpacing.x4,
-                        bottom: 120,
-                        child: _downloadNotice(context),
-                      ),
-                    if (_notice != null)
-                      Positioned(
-                        top: 80,
-                        left: 0,
-                        right: 0,
-                        child: IgnorePointer(
-                          child: Center(
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: AppSpacing.x4,
-                                vertical: AppSpacing.x2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: const Color(0xB3000000),
-                                    borderRadius:
-                                        BorderRadius.circular(AppRadius.md),
-                                    border: Border.all(
-                                      color: const Color(0x40FFFFFF),
-                                    ),
-                                  ),
-                                  child: Text(
-                                    _notice!,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: AppFontSize.xs,
-                                    ),
-                                  ),
+                    // Download and status notices cross-fade instead of
+                    // popping in and out.
+                    Positioned(
+                      right: AppSpacing.x4,
+                      bottom: 132,
+                      child: IgnorePointer(
+                        ignoring: !_controlsVisible,
+                        child: AnimatedSwitcher(
+                          duration: AppDuration.overlay,
+                          switchInCurve: AppDuration.ease,
+                          switchOutCurve: AppDuration.ease,
+                          transitionBuilder: (child, animation) =>
+                              FadeTransition(
+                            opacity: animation,
+                            child: SlideTransition(
+                              position: Tween<Offset>(
+                                begin: const Offset(0, 0.2),
+                                end: Offset.zero,
+                              ).animate(animation),
+                              child: child,
+                            ),
+                          ),
+                          child: _downloadQueued > 0
+                              ? _downloadNotice(context)
+                              : const SizedBox.shrink(
+                                  key: ValueKey('no-download-notice'),
                                 ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      top: 76,
+                      left: 0,
+                      right: 0,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: AnimatedSwitcher(
+                            duration: AppDuration.overlay,
+                            switchInCurve: AppDuration.ease,
+                            switchOutCurve: AppDuration.ease,
+                            transitionBuilder: (child, animation) =>
+                                FadeTransition(
+                              opacity: animation,
+                              child: SlideTransition(
+                                position: Tween<Offset>(
+                                  begin: const Offset(0, -0.2),
+                                  end: Offset.zero,
+                                ).animate(animation),
+                                child: child,
                               ),
                             ),
-                          ),
-                    if (_item != null || _isLocal || _title.isNotEmpty)
-                      Positioned(
-                        left: AppSpacing.x4,
-                        bottom: 116,
-                        // Leaves room for the action rail on the right.
-                        right: AppSpacing.x12 + AppSpacing.x4,
-                        child: IgnorePointer(
-                          ignoring: !_controlsVisible,
-                          child: AnimatedOpacity(
-                            opacity: _controlsVisible ? 1 : 0,
-                            duration: AppDuration.overlay,
-                            child: PlayerInfoCard(
-                              item: _item ??
-                                  Item(
-                                    id: _itemId,
-                                    title: _title,
-                                    cover: _cover,
+                            child: _notice == null
+                                ? const SizedBox.shrink(
+                                    key: ValueKey('no-notice'),
+                                  )
+                                : Container(
+                                    key: ValueKey(_notice),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: AppSpacing.x4,
+                                      vertical: AppSpacing.x2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: tokens.colors.glassStrong,
+                                      borderRadius: BorderRadius.circular(
+                                        AppRadius.md,
+                                      ),
+                                      border: Border.all(
+                                        color: tokens.colors.glassStrongBorder,
+                                      ),
+                                    ),
+                                    child: Text(
+                                      _notice!,
+                                      style: TextStyle(
+                                        color: tokens.colors.text,
+                                        fontSize: AppFontSize.xs,
+                                      ),
+                                    ),
                                   ),
-                              episodeLabel: _episodeLabel,
-                              onOpenDetail: _openDetail,
-                              local: _isLocal,
-                            ),
                           ),
                         ),
                       ),
-                    // 点赞 / 评论 / 收藏: the same rail the home feed uses.
-                    // It only needs the ids, so the detail entry shows it even
-                    // before /detail resolves.
-                    if (widget.api != null && _itemId.isNotEmpty)
-                      Positioned(
-                        right: AppSpacing.x3,
-                        bottom: 200,
-                        child: IgnorePointer(
-                          ignoring: !_controlsVisible,
-                          child: AnimatedOpacity(
-                            opacity: _controlsVisible ? 1 : 0,
-                            duration: AppDuration.overlay,
-                            child: SeriesActionRail(
-                              api: widget.api!,
-                              item: _item ??
-                                  Item(
-                                    id: _itemId,
-                                    title: _title,
-                                    cover: _cover,
-                                    type: 'series',
-                                  ),
-                              episodeId: _episodeId,
-                              stats: _episodeStats,
-                              onLikeChanged: (liked, likeCount) {
-                                setState(() {
-                                  _likeOverrides[_episodeId] = (
-                                    liked: liked,
-                                    likeCount: likeCount,
-                                  );
-                                });
-                              },
-                            ),
-                          ),
-                        ),
-                      ),
+                    ),
+                    // The title card, action rail and transport bar are one
+                    // bottom-anchored surface: a single fade + slide, one
+                    // scrim, and no absolute offsets that drift when the
+                    // window changes shape.
                     Positioned(
                       left: 0,
                       right: 0,
                       bottom: 0,
-                      child: AnimatedOpacity(
-                        opacity: _controlsVisible ? 1 : 0,
-                        duration: AppDuration.overlay,
-                        child: IgnorePointer(
-                          ignoring: !_controlsVisible,
-                          child: _controls(context),
+                      child: AnimatedSlide(
+                        offset: _controlsVisible
+                            ? Offset.zero
+                            : const Offset(0, 0.03),
+                        duration: const Duration(milliseconds: 320),
+                        curve: Curves.easeOutCubic,
+                        child: AnimatedOpacity(
+                          opacity: _controlsVisible ? 1 : 0,
+                          duration: const Duration(milliseconds: 320),
+                          curve: Curves.easeOutCubic,
+                          child: IgnorePointer(
+                            ignoring: !_controlsVisible,
+                            child: RepaintBoundary(
+                              // Resting on a control must not let the idle
+                              // timer hide the bar under the pointer.
+                              child: MouseRegion(
+                                onEnter: (_) => _hideTimer?.cancel(),
+                                onExit: (_) => _scheduleHide(),
+                                child: _bottomChrome(context),
+                              ),
+                            ),
+                          ),
                         ),
                       ),
                     ),
-                    // The speed menu lives in the page-level Stack: inside the
-                    // controls row it would sit outside that Stack's bounds and
-                    // could not be hit-tested, so moving onto it dismissed it.
-                    if (_speedHover)
-                      Positioned(
-                        right: 112,
-                        // Sits right above the speed button (the button row is
-                        // ~64px tall from the page bottom).
-                        bottom: 70,
-                        child: SpeedPanel(
-                          current: _engine.snapshot.value.rate,
-                          onPick: (rate) {
-                            _engine.setRate(rate);
-                            _rememberRate(rate);
-                            setState(() => _speedHover = false);
-                          },
-                          onEnter: () => _speedHideTimer?.cancel(),
-                          onExit: () {
-                            _speedHideTimer?.cancel();
-                            _speedHideTimer =
-                                Timer(const Duration(milliseconds: 350), () {
-                              if (mounted) {
-                                setState(() => _speedHover = false);
-                              }
-                            });
-                          },
-                        ),
-                      ),
                   ],
                 ),
               ),
@@ -2209,6 +2413,152 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
+  /// Right-click on the picture: the operations a desktop player is expected
+  /// to expose without moving the pointer to the control bar.
+  Future<void> _showVideoMenu(Offset globalPosition) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final local = overlay.globalToLocal(globalPosition);
+    final playing = _engine.snapshot.value.playing;
+    final action = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(local.dx, local.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        PopupMenuItem(value: 'play', child: Text(playing ? '暂停' : '播放')),
+        PopupMenuItem(
+          value: 'full',
+          child: Text(_fullscreen ? '退出全屏' : '全屏'),
+        ),
+        if (_episodes.isNotEmpty)
+          const PopupMenuItem(value: 'episodes', child: Text('选集')),
+        if (widget.api != null && _itemId.isNotEmpty)
+          const PopupMenuItem(value: 'detail', child: Text('详情')),
+        if (isDesktopPlatform && widget.windowToggle && _windowMode != null)
+          PopupMenuItem(
+            value: 'window',
+            child: Text(_windowMaximized ? '退出最大化' : '程序内最大化'),
+          ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'copy', child: Text('复制标题')),
+      ],
+    );
+    if (!mounted || action == null) return;
+    switch (action) {
+      case 'play':
+        unawaited(_togglePlay());
+      case 'full':
+        unawaited(_toggleFullscreen());
+      case 'episodes':
+        showEpisodesDrawer(
+          context,
+          episodes: _episodes,
+          currentId: _episodeId,
+          watched: _watchedIds,
+          onSelect: _playEpisode,
+        );
+      case 'detail':
+        unawaited(_openDetail());
+      case 'window':
+        _toggleWindowMaximized();
+      case 'copy':
+        unawaited(Clipboard.setData(ClipboardData(text: _title)));
+        _showNotice('已复制标题');
+    }
+  }
+
+  /// One bottom surface: title card + action rail above the transport bar, so
+  /// the chrome moves as a unit and a single scrim covers everything drawn
+  /// over the picture.
+  Widget _bottomChrome(BuildContext context) {
+    final showInfo = _item != null || _isLocal || _title.isNotEmpty;
+    // On short windows the rail would cover the picture; the transport bar
+    // and title card carry enough context on their own.
+    final showRail = widget.api != null &&
+        _itemId.isNotEmpty &&
+        MediaQuery.sizeOf(context).height >= 620;
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        // The scrim only needs to carry the transport row: keep the upper part
+        // almost clear and stop well short of opaque black.
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Color(0x00000000),
+            Color(0x1A000000),
+            Color(0x73000000),
+            Color(0xB3000000),
+          ],
+          stops: [0, 0.45, 0.78, 1],
+        ),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (showInfo || showRail)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(
+                  AppSpacing.x4,
+                  AppSpacing.x8,
+                  AppSpacing.x3,
+                  AppSpacing.x2,
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    if (showInfo)
+                      Expanded(
+                        child: PlayerInfoCard(
+                          item: _item ??
+                              Item(
+                                id: _itemId,
+                                title: _title,
+                                cover: _cover,
+                              ),
+                          episodeLabel: _episodeLabel,
+                          onOpenDetail: _openDetail,
+                          local: _isLocal,
+                        ),
+                      ),
+                    if (showRail) ...[
+                      const SizedBox(width: AppSpacing.x4),
+                      SeriesActionRail(
+                        api: widget.api!,
+                        item: _item ??
+                            Item(
+                              id: _itemId,
+                              title: _title,
+                              cover: _cover,
+                              type: 'series',
+                            ),
+                        episodeId: _episodeId,
+                        stats: _episodeStats,
+                        onLikeChanged: (liked, likeCount) {
+                          setState(() {
+                            _likeOverrides[_episodeId] = (
+                              liked: liked,
+                              likeCount: likeCount,
+                            );
+                          });
+                        },
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            _controls(context),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _controls(BuildContext context) {
     final tokens = AppTokens.of(context);
     return ValueListenableBuilder<PlaybackSnapshot>(
@@ -2217,248 +2567,438 @@ class _PlayerScreenState extends State<PlayerScreen> {
         final duration = snapshot.duration.inMilliseconds;
         final plan = _plan;
         final streams = plan?.streams ?? const <Stream>[];
-        return Container(
-          padding: EdgeInsets.fromLTRB(
-            AppSpacing.x4,
-            AppSpacing.x2,
-            AppSpacing.x4,
-            AppSpacing.x4,
-          ),
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [Color(0x00000000), Color(0xE6000000)],
-            ),
-          ),
-          child: SafeArea(
-            top: false,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  children: [
-                    Text(
-                      _format(snapshot.position),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: AppFontSize.xxs,
-                      ),
-                    ),
-                    Expanded(
-                      child: PlayerSeekBar(
-                        value: duration <= 0
-                            ? 0
-                            : (snapshot.position.inMilliseconds / duration)
-                                .clamp(0.0, 1.0),
-                        position: snapshot.position,
-                        duration: snapshot.duration,
-                        thumbs: _stripFor(plan),
-                        accent: tokens.colors.accent,
-                        onChanged: duration <= 0
-                            ? null
-                            : (value) {
-                                _engine.seek(
-                                  Duration(
-                                    milliseconds: (duration * value).round(),
-                                  ),
-                                );
-                                _showControls();
-                              },
-                      ),
-                    ),
-                    Text(
-                      _format(snapshot.duration),
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: AppFontSize.xxs,
-                      ),
-                    ),
-                  ],
-                ),
-                Row(
-                  children: [
-                    IconButton(
-                      tooltip: snapshot.playing ? '暂停' : '播放',
-                      color: Colors.white,
-                      onPressed: snapshot.ready ? _togglePlay : null,
-                      icon: Icon(
-                        snapshot.playing ? Icons.pause : Icons.play_arrow,
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: '下一集',
-                      color: Colors.white,
-                      onPressed: _episodes.isEmpty
-                          ? null
-                          : () => _stepEpisode(1),
-                      icon: const Icon(Icons.skip_next),
-                    ),
-                    if (_episodes.isNotEmpty)
-                      Text(
-                        _episodeCounter,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: AppFontSize.xs,
-                        ),
-                      ),
-                    const Spacer(),
-                    // 音量
-                    IconButton(
-                      tooltip: snapshot.volume <= 0.001 ? '取消静音' : '静音',
-                      color: Colors.white,
-                      onPressed: _toggleMute,
-                      icon: Icon(
-                        snapshot.volume <= 0.001
-                            ? Icons.volume_off
-                            : Icons.volume_up,
-                      ),
-                    ),
-                    SizedBox(
-                      width: 88,
-                      child: SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 2,
-                          thumbShape: const RoundSliderThumbShape(
-                            enabledThumbRadius: 5,
+        final index =
+            _episodes.indexWhere((episode) => episode.id == _episodeId);
+        final hasPrevious = index > 0;
+        final hasNext = index >= 0 && index + 1 < _episodes.length;
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final roomy = constraints.maxWidth >= 620;
+            final wide = constraints.maxWidth >= 900;
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(
+                AppSpacing.x4,
+                0,
+                AppSpacing.x2,
+                AppSpacing.x2,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Only this row follows the playhead; the rest of the bar
+                  // stays on the coarse snapshot.
+                  ValueListenableBuilder<Duration>(
+                    valueListenable: _engine.position,
+                    builder: (context, position, _) {
+                      return Row(
+                        children: [
+                          Text(
+                            _format(position),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: AppFontSize.xxs,
+                            ),
                           ),
-                          overlayShape: SliderComponentShape.noOverlay,
-                          activeTrackColor: tokens.colors.accent,
-                          inactiveTrackColor: Colors.white24,
-                          thumbColor: Colors.white,
-                        ),
-                        child: Slider(
-                          value: snapshot.volume.clamp(0.0, 1.0),
-                          onChanged: _setVolume,
-                        ),
-                      ),
-                    ),
-                    // 弹幕
-                    IconButton(
-                      tooltip: _danmakuOn ? '关闭弹幕' : '打开弹幕',
-                      color: _danmakuOn
-                          ? tokens.colors.accent
-                          : Colors.white70,
-                      onPressed: () =>
-                          setState(() => _danmakuOn = !_danmakuOn),
-                      icon: const Icon(Icons.subtitles_rounded),
-                    ),
-                    IconButton(
-                      tooltip: '弹幕列表',
-                      color: Colors.white70,
-                      onPressed: _openDanmaku,
-                      icon: const Icon(Icons.forum_outlined),
-                    ),
-                    IconButton(
-                      tooltip: '下载',
-                      color: Colors.white70,
-                      onPressed: _openDownload,
-                      icon: const Icon(Icons.download_outlined),
-                    ),
-                    // 清晰度：本地文件没有可选清晰度，也不显示源的占位值
-                    if (!_isLocal)
-                      TextButton(
-                        onPressed: streams.isEmpty
-                            ? null
-                            : () => showQualitySheet(context, streams: streams, current: _quality, onSelected: _switchQuality),
-                        child: Text(
-                          _quality.isEmpty ? '清晰度' : _quality,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: AppFontSize.xs,
+                          Expanded(
+                            child: PlayerSeekBar(
+                              value: duration <= 0
+                                  ? 0
+                                  : (position.inMilliseconds / duration)
+                                      .clamp(0.0, 1.0),
+                              position: position,
+                              duration: snapshot.duration,
+                              buffered: snapshot.buffered,
+                              thumbs: _stripFor(plan),
+                              accent: tokens.colors.accent,
+                              onChanged: duration <= 0
+                                  ? null
+                                  : (value) {
+                                      _engine.seek(
+                                        Duration(
+                                          milliseconds:
+                                              (duration * value).round(),
+                                        ),
+                                      );
+                                      _showControls();
+                                    },
+                            ),
                           ),
-                        ),
-                      ),
-                    // 倍速：悬停即显示，不弹 modal
-                    MouseRegion(
-                      onEnter: (_) {
-                        _speedHideTimer?.cancel();
-                        setState(() => _speedHover = true);
-                      },
-                      onExit: (_) {
-                        _speedHideTimer?.cancel();
-                        _speedHideTimer =
-                            Timer(const Duration(milliseconds: 350), () {
-                          if (mounted) setState(() => _speedHover = false);
-                        });
-                      },
-                      child: TextButton(
-                        onPressed: () =>
-                            setState(() => _speedHover = !_speedHover),
-                        child: Text(
-                          '${snapshot.rate}×',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: AppFontSize.xs,
+                          Text(
+                            _format(snapshot.duration),
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: AppFontSize.xxs,
+                            ),
                           ),
-                        ),
-                      ),
-                    ),
-                    // 选集
-                    if (_episodes.isNotEmpty)
-                      TextButton.icon(
-                        onPressed: () => showEpisodesDrawer(context, episodes: _episodes, currentId: _episodeId, watched: _watchedIds, onSelect: _playEpisode),
-                        icon: const Icon(
-                          Icons.list,
-                          size: 18,
-                          color: Colors.white,
-                        ),
-                        label: Text(
-                          '选集',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: AppFontSize.xs,
-                          ),
-                        ),
-                      ),
-                    // 作品系列（合集里有别的作品时才出现）
-                    if (_albumItems.isNotEmpty)
-                      TextButton.icon(
-                        onPressed: _openAlbum,
-                        icon: const Icon(
-                          Icons.collections_bookmark_outlined,
-                          size: 18,
-                          color: Colors.white,
-                        ),
-                        label: Text(
-                          '作品系列',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: AppFontSize.xs,
-                          ),
-                        ),
-                      ),
-                    // 程序内最大化：隐藏侧边栏，占满整个窗口
-                    if (widget.windowToggle && _windowMode != null)
+                        ],
+                      );
+                    },
+                  ),
+                  Row(
+                    children: [
                       IconButton(
-                        tooltip: _windowMaximized ? '退出最大化' : '程序内最大化',
+                        tooltip: '上一集',
                         color: Colors.white,
-                        onPressed: _toggleWindowMaximized,
+                        onPressed:
+                            hasPrevious ? () => _stepEpisode(-1) : null,
+                        icon: const Icon(Icons.skip_previous),
+                      ),
+                      if (roomy)
+                        IconButton(
+                          tooltip: '后退 10 秒 (←)',
+                          color: Colors.white,
+                          onPressed: () => _seekBy(-10),
+                          icon: const Icon(Icons.replay_10),
+                        ),
+                      IconButton(
+                        tooltip: snapshot.playing ? '暂停 (空格)' : '播放 (空格)',
+                        color: Colors.white,
+                        iconSize: 32,
+                        onPressed: snapshot.ready ? _togglePlay : null,
                         icon: Icon(
-                          _windowMaximized
-                              ? Icons.close_fullscreen
-                              : Icons.open_in_full,
+                          snapshot.playing
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
                         ),
                       ),
-                    // 全屏：最右侧
-                    IconButton(
-                      tooltip: _fullscreen ? '退出全屏' : '全屏',
-                      color: Colors.white,
-                      onPressed: _toggleFullscreen,
-                      icon: Icon(
-                        _fullscreen
-                            ? Icons.fullscreen_exit
-                            : Icons.fullscreen,
+                      if (roomy)
+                        IconButton(
+                          tooltip: '前进 10 秒 (→)',
+                          color: Colors.white,
+                          onPressed: () => _seekBy(10),
+                          icon: const Icon(Icons.forward_10),
+                        ),
+                      IconButton(
+                        tooltip: '下一集',
+                        color: Colors.white,
+                        onPressed: hasNext ? () => _stepEpisode(1) : null,
+                        icon: const Icon(Icons.skip_next),
                       ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
+                      if (roomy && _episodes.isNotEmpty)
+                        Text(
+                          _episodeCounter,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: AppFontSize.xs,
+                          ),
+                        ),
+                      const Spacer(),
+                      IconButton(
+                        tooltip: _danmakuOn ? '关闭弹幕' : '打开弹幕',
+                        color: _danmakuOn
+                            ? tokens.colors.accent
+                            : Colors.white70,
+                        onPressed: () =>
+                            setState(() => _danmakuOn = !_danmakuOn),
+                        icon: const Icon(Icons.subtitles_rounded),
+                      ),
+                      if (wide && _episodes.isNotEmpty)
+                        TextButton.icon(
+                          onPressed: () => showEpisodesDrawer(
+                            context,
+                            episodes: _episodes,
+                            currentId: _episodeId,
+                            watched: _watchedIds,
+                            onSelect: _playEpisode,
+                          ),
+                          icon: const Icon(
+                            Icons.list,
+                            size: 18,
+                            color: Colors.white,
+                          ),
+                          label: Text(
+                            '选集',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: AppFontSize.xs,
+                            ),
+                          ),
+                        ),
+                      if (wide)
+                        PopupMenuButton<double>(
+                          tooltip: '倍速',
+                          color: tokens.colors.surface2,
+                          onSelected: (rate) {
+                            _engine.setRate(rate);
+                            _rememberRate(rate);
+                            _showNotice('${rate}× 倍速');
+                          },
+                          itemBuilder: (context) => [
+                            for (final rate in const [
+                              0.5,
+                              0.75,
+                              1.0,
+                              1.25,
+                              1.5,
+                              2.0,
+                            ])
+                              PopupMenuItem<double>(
+                                value: rate,
+                                child: Row(
+                                  children: [
+                                    Text(
+                                      '${rate}×',
+                                      style: TextStyle(
+                                        fontSize: AppFontSize.xs,
+                                        color: (rate - snapshot.rate).abs() <
+                                                0.001
+                                            ? tokens.colors.accent
+                                            : tokens.colors.text2,
+                                      ),
+                                    ),
+                                    const Spacer(),
+                                    if ((rate - snapshot.rate).abs() < 0.001)
+                                      Icon(
+                                        Icons.check,
+                                        size: 14,
+                                        color: tokens.colors.accent,
+                                      ),
+                                  ],
+                                ),
+                              ),
+                          ],
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: AppSpacing.x2,
+                              vertical: AppSpacing.x3,
+                            ),
+                            child: Text(
+                              '${snapshot.rate}×',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: AppFontSize.xs,
+                              ),
+                            ),
+                          ),
+                        ),
+                      // 清晰度：本地文件没有可选清晰度
+                      if (wide && !_isLocal)
+                        TextButton(
+                          onPressed: streams.isEmpty
+                              ? null
+                              : () => showQualitySheet(
+                                    context,
+                                    streams: streams,
+                                    current: _quality,
+                                    onSelected: _switchQuality,
+                                  ),
+                          child: Text(
+                            _quality.isEmpty ? '清晰度' : _quality,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: AppFontSize.xs,
+                            ),
+                          ),
+                        ),
+                      _moreMenu(
+                        context,
+                        compact: !wide,
+                        streams: streams,
+                      ),
+                      _PlayerVolumeControl(
+                        volume: snapshot.volume,
+                        showSlider: roomy,
+                        onChanged: _setVolume,
+                        onToggleMute: _toggleMute,
+                      ),
+                      IconButton(
+                        tooltip: _fullscreen ? '退出全屏 (F)' : '全屏 (F)',
+                        color: Colors.white,
+                        onPressed: _toggleFullscreen,
+                        icon: Icon(
+                          _fullscreen
+                              ? Icons.fullscreen_exit
+                              : Icons.fullscreen,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          },
         );
       },
     );
+  }
+
+  Widget _moreMenu(
+    BuildContext context, {
+    required bool compact,
+    required List<Stream> streams,
+  }) {
+    final tokens = AppTokens.of(context);
+    return PopupMenuButton<_PlayerMenuAction>(
+      tooltip: '更多',
+      color: tokens.colors.surface2,
+      onSelected: (action) {
+        switch (action) {
+          case _PlayerMenuAction.quality:
+            showQualitySheet(
+              context,
+              streams: streams,
+              current: _quality,
+              onSelected: _switchQuality,
+            );
+          case _PlayerMenuAction.speed:
+            unawaited(_pickSpeed());
+          case _PlayerMenuAction.episodes:
+            showEpisodesDrawer(
+              context,
+              episodes: _episodes,
+              currentId: _episodeId,
+              watched: _watchedIds,
+              onSelect: _playEpisode,
+            );
+          case _PlayerMenuAction.danmaku:
+            unawaited(_openDanmaku());
+          case _PlayerMenuAction.download:
+            unawaited(_openDownload());
+          case _PlayerMenuAction.album:
+            unawaited(_openAlbum());
+          case _PlayerMenuAction.windowMax:
+            _toggleWindowMaximized();
+          case _PlayerMenuAction.copyTitle:
+            unawaited(Clipboard.setData(ClipboardData(text: _title)));
+            _showNotice('已复制标题');
+        }
+      },
+      itemBuilder: (context) => [
+        if (compact && !_isLocal)
+          PopupMenuItem(
+            value: _PlayerMenuAction.quality,
+            enabled: streams.isNotEmpty,
+            child: _menuRow(
+              context,
+              Icons.high_quality_outlined,
+              '清晰度',
+              _quality.isEmpty ? '自动' : _quality,
+            ),
+          ),
+        if (compact)
+          PopupMenuItem(
+            value: _PlayerMenuAction.speed,
+            child: _menuRow(
+              context,
+              Icons.speed_rounded,
+              '倍速',
+              '${_engine.snapshot.value.rate}×',
+            ),
+          ),
+        if (compact && _episodes.isNotEmpty)
+          PopupMenuItem(
+            value: _PlayerMenuAction.episodes,
+            child: _menuRow(
+              context,
+              Icons.list,
+              '选集',
+              _episodeCounter,
+            ),
+          ),
+        PopupMenuItem(
+          value: _PlayerMenuAction.danmaku,
+          enabled: widget.api != null,
+          child: _menuRow(context, Icons.forum_outlined, '弹幕列表', ''),
+        ),
+        PopupMenuItem(
+          value: _PlayerMenuAction.download,
+          enabled: !_isLocal && _episodes.isNotEmpty && widget.api != null,
+          child: _menuRow(context, Icons.download_outlined, '下载', ''),
+        ),
+        if (_albumItems.isNotEmpty)
+          PopupMenuItem(
+            value: _PlayerMenuAction.album,
+            child: _menuRow(
+              context,
+              Icons.collections_bookmark_outlined,
+              '作品系列',
+              '',
+            ),
+          ),
+        if (isDesktopPlatform && widget.windowToggle && _windowMode != null)
+          PopupMenuItem(
+            value: _PlayerMenuAction.windowMax,
+            child: _menuRow(
+              context,
+              _windowMaximized
+                  ? Icons.close_fullscreen
+                  : Icons.open_in_full,
+              _windowMaximized ? '退出最大化' : '程序内最大化',
+              '',
+            ),
+          ),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: _PlayerMenuAction.copyTitle,
+          child: _menuRow(context, Icons.copy_rounded, '复制标题', ''),
+        ),
+      ],
+      child: SizedBox(
+        width: 38,
+        height: 40,
+        child: Icon(Icons.more_horiz, color: tokens.colors.text2),
+      ),
+    );
+  }
+
+  Widget _menuRow(
+    BuildContext context,
+    IconData icon,
+    String label,
+    String value,
+  ) {
+    final tokens = AppTokens.of(context);
+    return Row(
+      children: [
+        Icon(icon, size: 16, color: tokens.colors.text2),
+        const SizedBox(width: AppSpacing.x2),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: AppFontSize.xs,
+            color: tokens.colors.text,
+          ),
+        ),
+        if (value.isNotEmpty) ...[
+          const Spacer(),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: AppFontSize.xxs,
+              color: tokens.colors.text3,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _pickSpeed() async {
+    final current = _engine.snapshot.value.rate;
+    final picked = await showDialog<double>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('播放速度'),
+        children: [
+          for (final rate in const [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(dialogContext).pop(rate),
+              child: Row(
+                children: [
+                  Text('${rate}×'),
+                  const Spacer(),
+                  if ((rate - current).abs() < 0.001)
+                    const Icon(Icons.check, size: 16),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (picked == null || !mounted) return;
+    await _engine.setRate(picked);
+    _rememberRate(picked);
+    _showNotice('${picked}× 倍速');
   }
 
 
@@ -2472,17 +3012,92 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 }
 
-/// Bullet lines driven by the playback position, so pausing and seeking keep
-/// the layer in sync. Scroll lines cross the width in 8 seconds.
+enum _PlayerMenuAction {
+  quality,
+  speed,
+  episodes,
+  danmaku,
+  download,
+  album,
+  windowMax,
+  copyTitle,
+}
 
+/// Mute button plus a volume slider that only becomes visible while the
+/// pointer is over the group. The slider keeps its space so the row never
+/// shifts when it appears.
+class _PlayerVolumeControl extends StatefulWidget {
+  const _PlayerVolumeControl({
+    required this.volume,
+    required this.showSlider,
+    required this.onChanged,
+    required this.onToggleMute,
+  });
 
-/// Hover card over the player: drama title (click → detail), current episode
-/// and the series intro. Hidden together with the controls.
+  final double volume;
+  final bool showSlider;
+  final ValueChanged<double> onChanged;
+  final VoidCallback onToggleMute;
 
+  @override
+  State<_PlayerVolumeControl> createState() => _PlayerVolumeControlState();
+}
 
-/// Right-side episode drawer: groups of 30 with a header per range and the
-/// current episode scrolled into view on open.
+class _PlayerVolumeControlState extends State<_PlayerVolumeControl> {
+  bool _hovering = false;
+  bool _dragging = false;
 
+  @override
+  Widget build(BuildContext context) {
+    final tokens = AppTokens.of(context);
+    final mute = widget.volume <= 0.001;
+    final visible = _hovering || _dragging;
+    final slider = SizedBox(
+      width: 84,
+      child: SliderTheme(
+        data: SliderTheme.of(context).copyWith(
+          trackHeight: 2,
+          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+          overlayShape: SliderComponentShape.noOverlay,
+          activeTrackColor: tokens.colors.accent,
+          inactiveTrackColor: Colors.white24,
+          thumbColor: Colors.white,
+        ),
+        child: Slider(
+          value: widget.volume.clamp(0.0, 1.0),
+          onChangeStart: (_) => setState(() => _dragging = true),
+          onChanged: widget.onChanged,
+          onChangeEnd: (_) => setState(() => _dragging = false),
+        ),
+      ),
+    );
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovering = true),
+      onExit: (_) => setState(() => _hovering = false),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: mute ? '取消静音 (M)' : '静音 (M)',
+            color: Colors.white,
+            onPressed: widget.onToggleMute,
+            icon: Icon(mute ? Icons.volume_off : Icons.volume_up),
+          ),
+          if (widget.showSlider)
+            AnimatedOpacity(
+              opacity: visible ? 1 : 0,
+              duration: AppDuration.micro,
+              curve: AppDuration.ease,
+              child: IgnorePointer(
+                ignoring: !visible,
+                child: ExcludeFocus(excluding: !visible, child: slider),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
 
 /// Opaque cover used while a new episode opens, so the engine's previous
 /// frame never shows under the new title.
@@ -2498,12 +3113,14 @@ class _SwitchCurtain extends StatelessWidget {
       fit: StackFit.expand,
       children: [
         if (cover.isNotEmpty)
+          // A full-screen 26 px blur used to be composited on every switch,
+          // exactly while the new stream was starting. The small cover
+          // already reads as a soft backdrop without the filter.
           CoverImage(
             url: cover,
             seed: title,
             fit: BoxFit.cover,
             decodeWidth: 240,
-            blurSigma: 26,
           ),
         const ColoredBox(color: Color(0x99000000)),
         const Center(child: LoadingMark()),

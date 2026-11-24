@@ -1,4 +1,5 @@
 import '../sp/models.dart';
+import '../storage/library_db.dart';
 import '../storage/local_store.dart';
 
 /// Local playback state. Progress/history/favorites never leave the device
@@ -201,9 +202,13 @@ class DownloadRecord {
 }
 
 class LocalLibrary {
-  LocalLibrary(this._store);
+  LocalLibrary(this._store, {LibraryDb? db}) : _db = db;
 
   final LocalStore _store;
+
+  /// SQLite when the platform provides it (Windows ships `winsqlite3.dll`);
+  /// the JSON store remains as a fallback.
+  final LibraryDb? _db;
 
   /// History, favourites, positions and downloads all live in one JSON file
   /// and every mutation is read-modify-write. Two of them running at once
@@ -218,16 +223,28 @@ class LocalLibrary {
   }
 
   Future<List<LibraryRecord>> history() async {
+    final db = _db;
+    if (db != null) {
+      return db.history().map(LibraryRecord.fromJson).toList(growable: false);
+    }
     final data = await _store.read();
     return _records(data['history']);
   }
 
   Future<List<LibraryRecord>> favorites() async {
+    final db = _db;
+    if (db != null) {
+      return db.favorites().map(LibraryRecord.fromJson).toList(growable: false);
+    }
     final data = await _store.read();
     return _records(data['favorites']);
   }
 
   Future<List<DownloadRecord>> downloads() async {
+    final db = _db;
+    if (db != null) {
+      return db.downloads().map(DownloadRecord.fromJson).toList(growable: false);
+    }
     final data = await _store.read();
     return listOr(data['downloads'])
         .map((e) => DownloadRecord.fromJson(mapOr(e)))
@@ -240,6 +257,8 @@ class LocalLibrary {
   /// where that episode stopped. Keyed by `series_key|episode_id`.
   Future<int> episodePosition(String seriesKey, String episodeId) async {
     if (episodeId.isEmpty) return 0;
+    final db = _db;
+    if (db != null) return db.episodeResume(seriesKey, episodeId);
     final data = await _store.read();
     final all = mapOr(data[_positionsKey]);
     final row = mapOr(all['$seriesKey|$episodeId']);
@@ -247,16 +266,46 @@ class LocalLibrary {
     return pos > 0 ? pos : 0;
   }
 
+  /// Resume point for one episode, treating finished entries as "start over".
+  /// The player uses this instead of [episodePosition] so a completed episode
+  /// never seeks to its last seconds and auto-advances again.
+  Future<int> episodeResumePosition(
+    String seriesKey,
+    String episodeId,
+  ) async {
+    if (episodeId.isEmpty) return 0;
+    final db = _db;
+    if (db != null) return db.episodeResume(seriesKey, episodeId);
+    final data = await _store.read();
+    final all = mapOr(data[_positionsKey]);
+    final row = mapOr(all['$seriesKey|$episodeId']);
+    if (row['completed'] == true) return 0;
+    final pos = intOr(row['position_sec']);
+    final duration = intOr(row['duration_sec']);
+    if (pos <= 0) return 0;
+    if (duration > 0 && pos >= duration - 5) return 0;
+    return pos;
+  }
+
   /// Every stored position for one series, keyed by episode id.
   Future<Map<String, int>> episodePositions(String seriesKey) async {
+    final db = _db;
+    if (db != null) return db.episodePositions(seriesKey);
     final data = await _store.read();
     final all = mapOr(data[_positionsKey]);
     final prefix = '$seriesKey|';
     final out = <String, int>{};
     for (final entry in all.entries) {
       if (!entry.key.startsWith(prefix)) continue;
-      final pos = intOr(mapOr(entry.value)['position_sec']);
-      if (pos > 0) out[entry.key.substring(prefix.length)] = pos;
+      final row = mapOr(entry.value);
+      final pos = intOr(row['position_sec']);
+      final duration = intOr(row['duration_sec']);
+      if (pos > 0) {
+        out[entry.key.substring(prefix.length)] = pos;
+      } else if (row['completed'] == true) {
+        out[entry.key.substring(prefix.length)] =
+            duration > 0 ? duration : 6;
+      }
     }
     return out;
   }
@@ -266,6 +315,8 @@ class LocalLibrary {
   /// a different unit, so the local map is the only trustworthy source for
   /// the progress bar.
   Future<Map<String, ({int position, int duration})>> episodeProgress() async {
+    final db = _db;
+    if (db != null) return db.episodeProgress();
     final data = await _store.read();
     final all = mapOr(data[_positionsKey]);
     final out = <String, ({int position, int duration})>{};
@@ -284,14 +335,29 @@ class LocalLibrary {
     String episodeId, {
     required int positionSec,
     required int durationSec,
+    bool completed = false,
   }) async {
     if (episodeId.isEmpty) return;
+    final db = _db;
+    if (db != null) {
+      await _mutate(() async {
+        db.recordEpisodePosition(
+          seriesKey,
+          episodeId,
+          positionSec: positionSec,
+          durationSec: durationSec,
+          completed: completed,
+        );
+      });
+      return;
+    }
     await _mutate(() async {
       final data = await _store.read();
       final all = Map<String, dynamic>.from(mapOr(data[_positionsKey]));
       all['$seriesKey|$episodeId'] = {
         'position_sec': positionSec,
         'duration_sec': durationSec,
+        'completed': completed,
         'updated_at': DateTime.now().toIso8601String(),
       };
       if (all.length > 300) {
@@ -306,9 +372,66 @@ class LocalLibrary {
     });
   }
 
+  /// A progress tick: history row and resume point in one mutation, so the
+  /// player no longer rewrites the whole store twice every few seconds.
+  Future<void> recordPlayback(
+    LibraryRecord record, {
+    required int resumePositionSec,
+    required int resumeDurationSec,
+    required bool completed,
+  }) async {
+    final db = _db;
+    if (db != null) {
+      await _mutate(() async {
+        db.recordPlayback(
+          record.toJson(),
+          resumePositionSec: resumePositionSec,
+          resumeDurationSec: resumeDurationSec,
+          completed: completed,
+        );
+      });
+      return;
+    }
+    await _mutate(() async {
+      final data = await _store.read();
+      final list = _records(data['history']);
+      final next = <LibraryRecord>[
+        record,
+        ...list.where((item) => item.seriesKey != record.seriesKey),
+      ];
+      final hidden = {..._stringSet(data['hidden_history'])}
+        ..remove(record.seriesKey);
+      final all = Map<String, dynamic>.from(mapOr(data[_positionsKey]));
+      if (record.episodeId.isNotEmpty) {
+        all['${record.seriesKey}|${record.episodeId}'] = {
+          'position_sec': resumePositionSec,
+          'duration_sec': resumeDurationSec,
+          'completed': completed,
+          'updated_at': record.updatedAt,
+        };
+      }
+      if (all.length > 300) {
+        final entries = all.entries.toList()
+          ..sort((a, b) => str(mapOr(b.value)['updated_at'])
+              .compareTo(str(mapOr(a.value)['updated_at'])));
+        all
+          ..clear()
+          ..addEntries(entries.take(300));
+      }
+      await _store.write({
+        ...data,
+        'history': next.map((e) => e.toJson()).toList(),
+        'hidden_history': hidden.toList(),
+        _positionsKey: all,
+      });
+    });
+  }
+
   /// Playback speed is one global preference: it survives episode changes,
   /// series changes and restarts.
   Future<double> playbackRate() async {
+    final db = _db;
+    if (db != null) return db.playbackRate();
     final data = await _store.read();
     final raw = data['playback_rate'];
     if (raw is num && raw >= 0.25 && raw <= 4) return raw.toDouble();
@@ -316,16 +439,28 @@ class LocalLibrary {
   }
 
   Future<void> setPlaybackRate(double rate) => _mutate(() async {
+        final db = _db;
+        if (db != null) {
+          db.setPlaybackRate(rate);
+          return;
+        }
         final data = await _store.read();
         await _store.write({...data, 'playback_rate': rate});
       });
 
   Future<bool> isFavorite(String seriesKey) async {
+    final db = _db;
+    if (db != null) return db.isFavorite(seriesKey);
     final list = await favorites();
     return list.any((record) => record.seriesKey == seriesKey);
   }
 
   Future<void> toggleFavorite(LibraryRecord record) => _mutate(() async {
+        final db = _db;
+        if (db != null) {
+          db.toggleFavorite(record.toJson());
+          return;
+        }
         final data = await _store.read();
         final list = _records(data['favorites']);
         final exists = list.any((item) => item.seriesKey == record.seriesKey);
@@ -347,6 +482,11 @@ class LocalLibrary {
   Future<void> removeFavorites(Set<String> seriesKeys) async {
     if (seriesKeys.isEmpty) return;
     await _mutate(() async {
+      final db = _db;
+      if (db != null) {
+        db.removeFavorites(seriesKeys);
+        return;
+      }
       final data = await _store.read();
       final list = _records(data['favorites'])
           .where((item) => !seriesKeys.contains(item.seriesKey))
@@ -361,11 +501,18 @@ class LocalLibrary {
   }
 
   Future<Set<String>> hiddenFavorites() async {
+    final db = _db;
+    if (db != null) return db.hiddenFavorites();
     final data = await _store.read();
     return _stringSet(data['hidden_favorites']);
   }
 
   Future<void> recordProgress(LibraryRecord record) => _mutate(() async {
+        final db = _db;
+        if (db != null) {
+          db.recordProgress(record.toJson());
+          return;
+        }
         final data = await _store.read();
         final list = _records(data['history']);
         final next = <LibraryRecord>[
@@ -386,6 +533,11 @@ class LocalLibrary {
   Future<void> removeHistory(Set<String> seriesKeys) async {
     if (seriesKeys.isEmpty) return;
     await _mutate(() async {
+      final db = _db;
+      if (db != null) {
+        db.removeHistory(seriesKeys);
+        return;
+      }
       final data = await _store.read();
       final list = _records(data['history'])
           .where((item) => !seriesKeys.contains(item.seriesKey))
@@ -400,6 +552,8 @@ class LocalLibrary {
   }
 
   Future<Set<String>> hiddenHistory() async {
+    final db = _db;
+    if (db != null) return db.hiddenHistory();
     final data = await _store.read();
     return _stringSet(data['hidden_history']);
   }
@@ -410,6 +564,11 @@ class LocalLibrary {
   }
 
   Future<void> addDownload(DownloadRecord record) => _mutate(() async {
+        final db = _db;
+        if (db != null) {
+          db.addDownload(record.toJson());
+          return;
+        }
         final data = await _store.read();
         final list = await downloads();
         final next = <DownloadRecord>[
@@ -423,6 +582,11 @@ class LocalLibrary {
       });
 
   Future<void> removeDownload(String assetId) => _mutate(() async {
+        final db = _db;
+        if (db != null) {
+          db.removeDownload(assetId);
+          return;
+        }
         final data = await _store.read();
         final list = await downloads();
         final next = list.where((item) => item.assetId != assetId).toList();

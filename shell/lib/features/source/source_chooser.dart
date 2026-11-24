@@ -59,6 +59,19 @@ class SourceChooser extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tokens = AppTokens.of(context);
+    String? activeName;
+    if (localActive) {
+      activeName = '本机视频';
+    } else {
+      for (final source in sources) {
+        if (source.sourceId == activeSourceId) {
+          activeName =
+              source.name.isEmpty ? source.sourceId : source.name;
+          break;
+        }
+      }
+    }
+    final canSwitch = sources.length + (localActive ? 0 : 1) > 1;
     return Align(
       alignment: Alignment.topCenter,
       child: ConstrainedBox(
@@ -77,7 +90,15 @@ class SourceChooser extends StatelessWidget {
               busy: busy,
               onAdd: onAdd,
             ),
-            const SizedBox(height: AppSpacing.x6),
+            const SizedBox(height: AppSpacing.x4),
+            if (activeName != null) ...[
+              _ActiveSourceHint(
+                name: activeName,
+                canSwitch: canSwitch,
+              ),
+              const SizedBox(height: AppSpacing.x4),
+            ] else
+              const SizedBox(height: AppSpacing.x2),
             if (recommended != null) ...[
               recommended!,
               const SizedBox(height: AppSpacing.x6),
@@ -111,6 +132,62 @@ class SourceChooser extends StatelessWidget {
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// One-line summary above the shelf: which source is live and what clicking
+/// another tile will do.
+class _ActiveSourceHint extends StatelessWidget {
+  const _ActiveSourceHint({required this.name, required this.canSwitch});
+
+  final String name;
+  final bool canSwitch;
+
+  @override
+  Widget build(BuildContext context) {
+    final tokens = AppTokens.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.x3,
+        vertical: AppSpacing.x2,
+      ),
+      decoration: BoxDecoration(
+        color: tokens.colors.accentWeak,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(
+          color: tokens.colors.accent.withValues(alpha: 0.35),
+        ),
+      ),
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: AppSpacing.x2,
+        runSpacing: AppSpacing.x1,
+        children: [
+          Icon(
+            Icons.check_circle,
+            size: 16,
+            color: tokens.colors.accent,
+          ),
+          Text(
+            '当前使用：$name',
+            style: TextStyle(
+              fontSize: AppFontSize.body,
+              fontWeight: FontWeight.w600,
+              color: tokens.colors.text,
+            ),
+          ),
+          if (canSwitch)
+            Text(
+              '点击下面其他源即可切换',
+              style: TextStyle(
+                fontSize: AppFontSize.xxs,
+                color: tokens.colors.text2,
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -475,9 +552,9 @@ class _TileState extends State<_Tile> {
     final tokens = AppTokens.of(context);
     final enabled = !widget.busy;
     final background = widget.active
-        ? tokens.colors.accentWeak.withValues(alpha: 0.35)
+        ? tokens.colors.accentWeak.withValues(alpha: 0.5)
         : _hovered
-            ? tokens.colors.surface3.withValues(alpha: 0.5)
+            ? tokens.colors.surface3.withValues(alpha: 0.7)
             : tokens.colors.surface2.withValues(alpha: 0.55);
     final border = widget.active
         ? tokens.colors.accent
@@ -494,9 +571,14 @@ class _TileState extends State<_Tile> {
         onExit: (_) => setState(() => _hovered = false),
         child: Material(
           color: background,
+          elevation: widget.active ? 2 : (_hovered ? 1 : 0),
+          shadowColor: tokens.colors.accent.withValues(alpha: 0.28),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(AppRadius.lg),
-            side: BorderSide(color: border),
+            side: BorderSide(
+              color: border,
+              width: widget.active ? 2 : 1,
+            ),
           ),
           clipBehavior: Clip.antiAlias,
           animationDuration: AppDuration.micro,
@@ -536,6 +618,7 @@ class _TileState extends State<_Tile> {
                                     label: '使用中',
                                     color: tokens.colors.accentWeak,
                                     textColor: tokens.colors.accent,
+                                    icon: Icons.check,
                                   ),
                                 ],
                               ],
@@ -571,13 +654,41 @@ class _TileState extends State<_Tile> {
                         ),
                       ),
                       const Spacer(),
-                      Icon(
-                        Icons.chevron_right,
-                        size: 18,
-                        color: widget.active
-                            ? tokens.colors.accent
-                            : tokens.colors.text3,
-                      ),
+                      if (widget.active) ...[
+                        Icon(
+                          Icons.check_circle,
+                          size: 14,
+                          color: tokens.colors.accent,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '当前使用',
+                          style: TextStyle(
+                            fontSize: AppFontSize.xxs,
+                            fontWeight: FontWeight.w600,
+                            color: tokens.colors.accent,
+                          ),
+                        ),
+                      ] else ...[
+                        Text(
+                          _hovered ? '点击切换' : '切换',
+                          style: TextStyle(
+                            fontSize: AppFontSize.xxs,
+                            fontWeight: FontWeight.w600,
+                            color: _hovered
+                                ? tokens.colors.accent
+                                : tokens.colors.text3,
+                          ),
+                        ),
+                        const SizedBox(width: 2),
+                        Icon(
+                          Icons.chevron_right,
+                          size: 18,
+                          color: _hovered
+                              ? tokens.colors.accent
+                              : tokens.colors.text3,
+                        ),
+                      ],
                     ],
                   ),
                 ],
@@ -595,11 +706,13 @@ class _Tag extends StatelessWidget {
     required this.label,
     required this.color,
     required this.textColor,
+    this.icon,
   });
 
   final String label;
   final Color color;
   final Color textColor;
+  final IconData? icon;
 
   @override
   Widget build(BuildContext context) {
@@ -612,13 +725,22 @@ class _Tag extends StatelessWidget {
         color: color,
         borderRadius: BorderRadius.circular(AppRadius.pill),
       ),
-      child: Text(
-        label,
-        style: TextStyle(
-          fontSize: AppFontSize.xxs,
-          fontWeight: FontWeight.w600,
-          color: textColor,
-        ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 11, color: textColor),
+            const SizedBox(width: 2),
+          ],
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: AppFontSize.xxs,
+              fontWeight: FontWeight.w600,
+              color: textColor,
+            ),
+          ),
+        ],
       ),
     );
   }

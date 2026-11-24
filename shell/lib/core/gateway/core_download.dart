@@ -40,10 +40,14 @@ class CoreDownload {
   }) async {
     await cleanupPendingRemoval();
     final installed = _installedPath();
-    final manifest = await _check();
-    if (manifest == null) return installed;
     final target = installed ?? _targetPath();
     final current = await _sha256Of(File(target));
+    // A locally built core can be pinned: the desktop app is also the place
+    // where that DLL is developed, and the public manifest would otherwise
+    // replace it with the older announced build on the next launch.
+    if (current != null && _pinnedMatches(current)) return target;
+    final manifest = await _check();
+    if (manifest == null) return current != null ? target : installed;
     // A manifest without a digest cannot be verified; keeping the installed
     // copy beats downloading one that would be rejected every launch.
     if (manifest.sha256.isEmpty) {
@@ -71,6 +75,15 @@ class CoreDownload {
       _writeFailure(manifest);
     }
     return File(target).existsSync() ? target : null;
+  }
+
+  /// True when the descriptor on disk pins exactly the installed bytes.
+  /// Changing or deleting the DLL falls back to the normal update check.
+  bool _pinnedMatches(String current) {
+    final descriptor = _readDescriptor();
+    if (descriptor == null || descriptor['pinned'] != true) return false;
+    final sha = (descriptor['sha256'] ?? '').toString().toLowerCase();
+    return sha.isNotEmpty && sha == current;
   }
 
   Map<String, dynamic>? _readDescriptor() {

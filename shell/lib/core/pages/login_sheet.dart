@@ -320,9 +320,9 @@ class _LoginSheetState extends State<LoginSheet> {
                 Text(
                   _error!,
                   textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: Color(0xFFE8453C),
-                    fontSize: 12,
+                  style: TextStyle(
+                    color: tokens.colors.danger,
+                    fontSize: AppFontSize.xs,
                   ),
                 ),
               ],

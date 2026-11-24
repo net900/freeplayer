@@ -256,6 +256,7 @@ class LocalJsSourceApi implements SourceApi, ClosableSourceApi {
     String channel = '',
     String cursor = '',
     int limit = 20,
+    bool refresh = false,
   }) async {
     final context = <String, Object?>{
       'channel': channel,

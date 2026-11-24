@@ -283,6 +283,9 @@ class DownloadManager extends ChangeNotifier {
         itemId: task.itemId,
         episodeId: task.episodeId,
         quality: task.quality.isEmpty ? Quality.auto : task.quality,
+        // Downloads get the H.264 copy too, so a bytevc2 episode lands as a
+        // file every player can open.
+        transcode: true,
       ));
       if (_cancelled.contains(task.assetId)) return;
       final stream = Quality.pick(plan.streams, quality: task.quality);

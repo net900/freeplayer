@@ -89,7 +89,10 @@ class _ProfileDialog extends StatelessWidget {
                   name.isEmpty ? '已登录' : name,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: AppFontSize.bodyLg),
+                  style: TextStyle(
+                    fontSize: AppFontSize.bodyLg,
+                    color: tokens.colors.text,
+                  ),
                 ),
                 if (id.isNotEmpty)
                   Padding(

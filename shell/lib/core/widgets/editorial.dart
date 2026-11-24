@@ -38,9 +38,12 @@ class UnderlineTab extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.baseline,
               textBaseline: TextBaseline.alphabetic,
               children: [
-                Text(
-                  label,
-                  style: TextStyle(
+                AnimatedDefaultTextStyle(
+                  duration: AppDuration.micro,
+                  curve: AppDuration.ease,
+                  // Inherit the app's font family/fallback as well; a bare
+                  // TextStyle would replace the ambient default.
+                  style: DefaultTextStyle.of(context).style.copyWith(
                     fontSize:
                         compact ? AppFontSize.xs : AppFontSize.bodyLg,
                     fontWeight:
@@ -49,6 +52,7 @@ class UnderlineTab extends StatelessWidget {
                         ? tokens.colors.text
                         : tokens.colors.text2,
                   ),
+                  child: Text(label),
                 ),
                 if (count > 0) ...[
                   const SizedBox(width: AppSpacing.x1),

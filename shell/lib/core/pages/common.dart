@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../l10n/strings.dart';
+import '../platform/platform.dart';
 import '../sp/models.dart';
 import '../theme/app_theme.dart';
 import '../theme/tokens.dart';
@@ -30,19 +31,42 @@ String formatCountPrecise(int value) {
 }
 
 class ContentFrame extends StatelessWidget {
-  const ContentFrame({super.key, required this.child, this.scrollable = false});
+  const ContentFrame({
+    super.key,
+    required this.child,
+    this.scrollable = false,
+    this.maxWidth = AppSizes.maxContentWidth,
+  });
 
   final Widget child;
   final bool scrollable;
 
+  /// Content wider than this is centred instead of stretched. Pass null for
+  /// layouts that must fill the window.
+  final double? maxWidth;
+
   @override
   Widget build(BuildContext context) {
+    // Edge-to-edge Android draws under the gesture bar; keep the last row
+    // reachable.
+    final bottomInset =
+        isMobilePlatform ? MediaQuery.paddingOf(context).bottom : 0.0;
     return Padding(
-      padding: const EdgeInsets.symmetric(
-        horizontal: AppSizes.contentPadX,
-        vertical: AppSizes.contentPadY,
+      padding: EdgeInsets.only(
+        left: AppSizes.contentPadX,
+        right: AppSizes.contentPadX,
+        top: AppSizes.contentPadY,
+        bottom: AppSizes.contentPadY + bottomInset,
       ),
-      child: scrollable ? SingleChildScrollView(child: child) : child,
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          constraints: maxWidth == null
+              ? const BoxConstraints()
+              : BoxConstraints(maxWidth: maxWidth!),
+          child: scrollable ? SingleChildScrollView(child: child) : child,
+        ),
+      ),
     );
   }
 }
@@ -259,7 +283,7 @@ class ItemGrid extends StatelessWidget {
   const ItemGrid({
     super.key,
     required this.children,
-    this.maxCrossAxisExtent = 180,
+    this.maxCrossAxisExtent = 200,
     this.padding = const EdgeInsets.all(AppSpacing.x1),
   });
 

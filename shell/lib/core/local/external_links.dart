@@ -1,8 +1,15 @@
 import 'dart:io';
 
+import '../platform/android_host.dart';
+import '../platform/platform.dart';
+
 /// Opens a project link in the user's default browser. Failures are silent:
 /// the address is also shown in the settings row so it can be copied.
 Future<void> openExternalUrl(String url) async {
+  if (isAndroidPlatform) {
+    await AndroidHost.openUrl(url);
+    return;
+  }
   if (!Platform.isWindows) return;
   final uri = Uri.tryParse(url);
   if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return;

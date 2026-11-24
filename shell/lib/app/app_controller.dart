@@ -57,11 +57,15 @@ class AppController extends ChangeNotifier {
   final Map<String, UIManifest> _localUi = {};
   bool _initialized = false;
   int _sourceRevision = 0;
+  // A source switch starts a background manifest refresh. A response for the
+  // previous source must never replace the manifest of the new one.
+  int _refreshToken = 0;
   bool _busy = false;
   String? _error;
   bool _preview = false;
   bool _immersive = false;
   bool _corePending = false;
+  bool _coreStarting = false;
   CoreDownloadState? _coreDownload;
   bool _loggedIn = false;
   AccountUser? _account;
@@ -103,6 +107,23 @@ class AppController extends ChangeNotifier {
     if (_corePending == value) return;
     _corePending = value;
     notifyListeners();
+  }
+
+  /// True while the installed core is starting and its loopback port is not
+  /// known yet. Pages wait for this instead of calling the previous session's
+  /// port and showing a timeout.
+  bool get coreStarting => _coreStarting;
+
+  void setCoreStarting(bool value) {
+    if (_coreStarting == value) return;
+    _coreStarting = value;
+    notifyListeners();
+  }
+
+  bool get activeSourceIsCore {
+    final source = activeSource;
+    if (source == null) return false;
+    return _gatewayFor(source.gatewayId)?.kind == 'core';
   }
 
   /// Download progress for the source core, or null when nothing is being
@@ -178,6 +199,14 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// A mobile build applies a source update in place instead of restarting;
+  /// this releases the overlay once the fresh packages are loaded.
+  void clearRestarting() {
+    _restarting = false;
+    _updated.clear();
+    notifyListeners();
+  }
+
   /// True while the player's fullscreen button is on: the custom title bar is
   /// hidden so the video covers the whole window.
   bool get immersive => _immersive;
@@ -202,6 +231,16 @@ class AppController extends ChangeNotifier {
   }
 
   String get activeSourceId => activeSource?.sourceId ?? '';
+
+  /// True when the source's gateway runs on this machine (the in-process core
+  /// or a local JS runtime). Background plan warming then competes with the
+  /// player for CPU and memory, so prefetching stays conservative.
+  bool get activeSourceRunsLocally {
+    final source = activeSource;
+    if (source == null) return false;
+    final gateway = _gatewayFor(source.gatewayId);
+    return gateway != null && gateway.kind != 'remote';
+  }
 
   Color? get themeSeed {
     final raw = activeSource?.manifest?.brand?.theme?.seed ??
@@ -228,7 +267,8 @@ class AppController extends ChangeNotifier {
   }
 
   /// Reads the account state so the sidebar and settings can show the user.
-  Future<void> refreshLogin() async {
+  /// Returns whether the gateway answered; a failure keeps the previous state.
+  Future<bool> refreshLogin() async {
     final api = _sourceApi;
     if (api == null) {
       if (_loggedIn || _account != null) {
@@ -236,7 +276,7 @@ class AppController extends ChangeNotifier {
         _account = null;
         notifyListeners();
       }
-      return;
+      return false;
     }
     try {
       final user = await api.account();
@@ -248,8 +288,21 @@ class AppController extends ChangeNotifier {
       _loggedIn = user.loggedIn;
       _account = nextAccount;
       if (changed) notifyListeners();
+      return true;
     } on Object {
       // Keep the previous state on a transient gateway error.
+      return false;
+    }
+  }
+
+  /// The gateway keeps the session on disk, but it may still be booting when
+  /// the shell starts. Retry until it answers once, so a signed-in account
+  /// appears without the user opening the login sheet.
+  Future<void> _refreshLoginOnStart() async {
+    for (var attempt = 0; attempt < 5; attempt++) {
+      if (!_initialized) return;
+      if (await refreshLogin()) return;
+      await Future<void>.delayed(Duration(seconds: 2 + attempt * 2));
     }
   }
 
@@ -264,8 +317,19 @@ class AppController extends ChangeNotifier {
     _initialized = true;
     notifyListeners();
     if (!_gatewayState.localMode && source != null) {
-      unawaited(refreshUi());
-      unawaited(refreshLogin());
+      // A cached manifest already drives the first frame. Refresh it after the
+      // first feed request has started: on a cold launch the upstream calls
+      // otherwise compete for the same gateway slots and make the first feed
+      // (and the first play plan) wait.
+      if (_uiManifest != null) {
+        unawaited(() async {
+          await Future<void>.delayed(const Duration(seconds: 8));
+          if (_initialized) await refreshUi();
+        }());
+      } else {
+        unawaited(refreshUi());
+      }
+      unawaited(_refreshLoginOnStart());
     }
   }
 
@@ -733,15 +797,22 @@ class AppController extends ChangeNotifier {
 
   Future<void> selectSource(DiscoveredSource source) async {
     _preview = false;
-    _clearImages();
     _gatewayState = _gatewayState.copyWith(
       activeSourceId: source.sourceId,
       localMode: false,
     );
     _activate(source);
-    await _gatewayStore.save(_gatewayState);
     notifyListeners();
-    await refreshUi();
+    await _gatewayStore.save(_gatewayState);
+    // The cached UI manifest is enough to open the source. The refreshes used
+    // to be awaited here, so choosing a source kept the chooser spinning for
+    // two gateway round trips (and up to the full retry budget when the core
+    // was still starting). Run them behind the page instead, after the first
+    // feed request has had a moment to start.
+    unawaited(() async {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (activeSourceId == source.sourceId) await refreshUi();
+    }());
   }
 
   /// Re-opens the active source so pages fetch from the current build. Used
@@ -821,10 +892,14 @@ class AppController extends ChangeNotifier {
     // Installing the core tears the gateway down and brings it back; asking
     // for data in between only produces failures the user cannot act on.
     if (_corePending) return;
+    final token = ++_refreshToken;
     // Capabilities and names are part of the source manifest and can change
     // server-side (e.g. a source gains auth). Refresh them every launch so a
     // cached discovery from an older build does not hide features.
     await _refreshSources(source.gatewayId);
+    if (token != _refreshToken || activeSource?.sourceId != source.sourceId) {
+      return;
+    }
     final manifest = activeSource?.manifest;
     if (manifest != null) {
       unawaited(_ensureDecryptors(manifest.decryptors));
@@ -836,6 +911,11 @@ class AppController extends ChangeNotifier {
         source.sourceId,
         clientPages: PageTypes.all,
       );
+      // A source switch (or a second refresh) owns the screen now; an older
+      // response must not replace its manifest.
+      if (token != _refreshToken || activeSource?.sourceId != source.sourceId) {
+        return;
+      }
       // The manifest is fetched on every launch but only replaced when it
       // actually changed; a failed fetch keeps the cached one (set by
       // _activate), so the app still starts with the last good config.
@@ -853,15 +933,21 @@ class AppController extends ChangeNotifier {
       _error = null;
     } catch (error) {
       // A cached menu stays usable when the gateway is unreachable.
-      if (!_isStaleClient(error)) _error = _messageOf(error);
+      if (token == _refreshToken && !_isStaleClient(error)) {
+        _error = _messageOf(error);
+      }
     } finally {
-      notifyListeners();
+      if (token == _refreshToken) {
+        notifyListeners();
+        // A source switch or a gateway restart can change which account is
+        // signed in; reload it whenever the UI manifest settles.
+        unawaited(refreshLogin());
+      }
     }
   }
 
   Future<void> enableLocalMode() async {
     _preview = false;
-    _clearImages();
     _client?.close();
     _client = null;
     _sourceApi = null;
@@ -970,7 +1056,6 @@ class AppController extends ChangeNotifier {
       _sourceApi = _localApis[gateway.id];
       _uiManifest = _localUi[gateway.id];
       _error = _sourceApi == null ? '本地源尚未加载' : null;
-      unawaited(_warmFilters());
       return;
     }
     // A login belongs to the source, not to one client instance: carry it
@@ -993,10 +1078,6 @@ class AppController extends ChangeNotifier {
         );
     _sourceApi = GatewaySourceApi(client, manifest);
     _uiManifest = _gatewayState.uiFor(source);
-    // Warm the filter panels after startup so opening the category or rank
-    // page does not wait on the selector request. Failures stay silent; the
-    // page still has its own retry.
-    unawaited(_warmFilters());
   }
 
   /// Installs hash-pinned decryption modules declared by the active source.
@@ -1009,23 +1090,6 @@ class AppController extends ChangeNotifier {
       await registry.ensureAll(specs);
     } on Object {
       // Keep the source usable; playback reports the missing module.
-    }
-  }
-
-  Future<void> _warmFilters() async {
-    final api = _sourceApi;
-    if (api == null) return;
-    await Future.wait<void>([
-      _ignoreFailure(api.categoryMeta()),
-      _ignoreFailure(api.rankMeta()),
-    ]);
-  }
-
-  Future<void> _ignoreFailure(Future<Object?> future) async {
-    try {
-      await future;
-    } on Object {
-      // The cache drops failed futures; the page can retry.
     }
   }
 
@@ -1074,14 +1138,6 @@ class AppController extends ChangeNotifier {
   void _setBusy(bool value) {
     _busy = value;
     notifyListeners();
-  }
-
-  /// Covers belong to the old source; keeping them costs memory and can show
-  /// the wrong artwork after a switch.
-  void _clearImages() {
-    final cache = PaintingBinding.instance.imageCache;
-    cache.clear();
-    cache.clearLiveImages();
   }
 
   @override

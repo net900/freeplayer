@@ -14,7 +14,7 @@ class AppLog {
   static bool _installed = false;
 
   static void install() {
-    if (_installed || !Platform.isWindows) return;
+    if (_installed) return;
     _installed = true;
     try {
       final dir = Directory(joinPath(appDataDirectory().path, 'logs'));

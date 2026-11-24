@@ -10,9 +10,13 @@ import 'playback_engine.dart';
 class StubPlaybackEngine implements PlaybackEngine {
   final ValueNotifier<PlaybackSnapshot> _snapshot =
       ValueNotifier(const PlaybackSnapshot());
+  final ValueNotifier<Duration> _position = ValueNotifier(Duration.zero);
 
   @override
   ValueListenable<PlaybackSnapshot> get snapshot => _snapshot;
+
+  @override
+  ValueListenable<Duration> get position => _position;
 
   @override
   Future<void> open(MediaPlan plan, {bool autoPlay = true}) async {
@@ -32,7 +36,16 @@ class StubPlaybackEngine implements PlaybackEngine {
   }
 
   @override
+  Future<void> queueNext(MediaPlan plan) async {}
+
+  @override
+  Future<bool> playQueuedNext(String episodeId) async => false;
+
+  @override
   Future<void> play() async {}
+
+  @override
+  Future<String> hardwareDecoder() async => '';
 
   @override
   Future<void> pause() async {}
@@ -41,7 +54,9 @@ class StubPlaybackEngine implements PlaybackEngine {
   Future<void> release() async {}
 
   @override
-  Future<void> seek(Duration position) async {}
+  Future<void> seek(Duration position) async {
+    _position.value = position;
+  }
 
   @override
   Future<void> setRate(double rate) async {
@@ -55,6 +70,7 @@ class StubPlaybackEngine implements PlaybackEngine {
 
   @override
   Future<void> dispose() async {
+    _position.dispose();
     _snapshot.dispose();
   }
 

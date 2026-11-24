@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../logging/app_log.dart';
 import '../sp/models.dart';
 import 'source_api.dart';
 
@@ -143,14 +144,20 @@ class GatewayClient {
     String channel = '',
     String cursor = '',
     int limit = 20,
+    bool refresh = false,
   }) async {
     final data = await _get(
       '/v1/${Uri.encodeComponent(sourceId)}/feed',
       query: {
         if (channel.isNotEmpty) 'channel': channel,
         if (cursor.isNotEmpty) 'cursor': cursor,
+        if (refresh) 'refresh': '1',
         'limit': '$limit',
       },
+      // Feed pages are prefetched in the background and may wait for an
+      // in-flight page build; give them time to land instead of failing and
+      // re-requesting the same slow cell.
+      timeout: const Duration(seconds: 26),
     );
     return ItemPage.fromJson(data);
   }
@@ -739,8 +746,10 @@ class GatewayClient {
     String path, {
     Map<String, String>? query,
     Map<String, String>? headers,
+    Duration? timeout,
   }) {
-    return _request('GET', path, query: query, headers: headers);
+    return _request('GET', path,
+        query: query, headers: headers, timeout: timeout);
   }
 
   Future<Map<String, dynamic>> _post(
@@ -759,6 +768,7 @@ class GatewayClient {
     Map<String, String>? query,
     Map<String, String>? headers,
     Map<String, dynamic>? body,
+    Duration? timeout,
   }) {
     // Read the source id before route mapping: the final path may be a
     // source-defined URL that no longer contains /v1/<sid>/.
@@ -770,6 +780,7 @@ class GatewayClient {
       sourceId: sourceId,
       headers: headers,
       body: body,
+      timeout: timeout,
     );
   }
 
@@ -786,6 +797,7 @@ class GatewayClient {
     String? sourceId,
     Map<String, String>? headers,
     Map<String, dynamic>? body,
+    Duration? timeout,
   }) async {
     final attempts = method == 'GET' ? 3 : 1;
     for (var attempt = 0; ; attempt++) {
@@ -796,6 +808,7 @@ class GatewayClient {
           sourceId: sourceId,
           headers: headers,
           body: body,
+          timeout: timeout,
         );
       } on Object catch (error) {
         if (attempt + 1 >= attempts || !_isTransient(error)) rethrow;
@@ -816,8 +829,40 @@ class GatewayClient {
     String? sourceId,
     Map<String, String>? headers,
     Map<String, dynamic>? body,
+    Duration? timeout,
   }) async {
-    final request = await _http.openUrl(method, uri).timeout(timeout);
+    final started = DateTime.now();
+    var status = 0;
+    final query = uri.query.isEmpty
+        ? ''
+        : '?${uri.query.length > 140 ? '${uri.query.substring(0, 140)}…' : uri.query}';
+    try {
+      return await _sendOnceInner(
+        method,
+        uri,
+        sourceId: sourceId,
+        headers: headers,
+        body: body,
+        onStatus: (value) => status = value,
+        timeout: timeout,
+      );
+    } finally {
+      AppLog.write('gw $method ${uri.path}$query status=$status '
+          '${DateTime.now().difference(started).inMilliseconds}ms');
+    }
+  }
+
+  Future<Map<String, dynamic>> _sendOnceInner(
+    String method,
+    Uri uri, {
+    String? sourceId,
+    Map<String, String>? headers,
+    Map<String, dynamic>? body,
+    required void Function(int) onStatus,
+    Duration? timeout,
+  }) async {
+    final requestTimeout = timeout ?? this.timeout;
+    final request = await _http.openUrl(method, uri).timeout(requestTimeout);
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     request.headers.set('X-Client-Id', clientId);
     request.headers.set('X-Source-Protocol', '1');
@@ -828,8 +873,9 @@ class GatewayClient {
       request.add(utf8.encode(jsonEncode(body)));
     }
 
-    final response = await request.close().timeout(timeout);
-    final bytes = await response.timeout(timeout).fold<List<int>>(
+    final response = await request.close().timeout(requestTimeout);
+    onStatus(response.statusCode);
+    final bytes = await response.timeout(requestTimeout).fold<List<int>>(
       <int>[],
       (acc, chunk) => acc..addAll(chunk),
     );
@@ -1059,6 +1105,10 @@ class GatewaySourceApi implements SourceApi {
   // hitting the gateway again.
   Future<List<FilterGroup>>? _categoryMetaCache;
   final Map<String, Future<RankMeta>> _rankMetaCache = {};
+  // The detail page loads 作品系列 first; opening the player then asks for the
+  // same collection. Keep the successful page so the second screen is instant
+  // and the gateway is not asked twice.
+  final Map<String, ({ItemPage page, DateTime exp})> _albumCache = {};
 
   @override
   final SourceManifest manifest;
@@ -1087,8 +1137,19 @@ class GatewaySourceApi implements SourceApi {
   Future<MediaPlan> play(PlayRequest request) => _client.play(sourceId, request);
 
   @override
-  Future<ItemPage> feed({String channel = '', String cursor = '', int limit = 20}) =>
-      _client.feed(sourceId, channel: channel, cursor: cursor, limit: limit);
+  Future<ItemPage> feed({
+    String channel = '',
+    String cursor = '',
+    int limit = 20,
+    bool refresh = false,
+  }) =>
+      _client.feed(
+        sourceId,
+        channel: channel,
+        cursor: cursor,
+        limit: limit,
+        refresh: refresh,
+      );
 
   @override
   Future<ItemPage> rank({
@@ -1450,8 +1511,22 @@ class GatewaySourceApi implements SourceApi {
       _client.likes(sourceId, cursor: cursor, limit: limit);
 
   @override
-  Future<ItemPage> album(String itemId, {String albumId = ''}) =>
-      _client.album(sourceId, itemId, albumId: albumId);
+  Future<ItemPage> album(String itemId, {String albumId = ''}) {
+    final key = '$itemId|$albumId';
+    final cached = _albumCache[key];
+    if (cached != null && cached.exp.isAfter(DateTime.now())) {
+      return Future.value(cached.page);
+    }
+    return _client.album(sourceId, itemId, albumId: albumId).then((page) {
+      if (page.items.isNotEmpty) {
+        _albumCache[key] = (
+          page: page,
+          exp: DateTime.now().add(const Duration(minutes: 10)),
+        );
+      }
+      return page;
+    });
+  }
 
   @override
   Future<ItemPage> related(

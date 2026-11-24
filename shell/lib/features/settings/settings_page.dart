@@ -7,6 +7,7 @@ import '../../core/decryptor/decryptor_registry.dart';
 import '../../core/pages/common.dart';
 import '../../core/local/external_links.dart';
 import '../../core/pages/loading.dart';
+import '../../core/platform/platform.dart';
 import '../../core/settings/settings.dart';
 import '../../core/sp/quality.dart';
 import '../../core/update/update_service.dart';
@@ -42,6 +43,9 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _loadAssociation() async {
+    // Android declares its handlers in the manifest; there is nothing to
+    // query and the section is hidden.
+    if (!isDesktopPlatform) return;
     try {
       final value = await AppScope.of(context).fileAssociation.isRegistered();
       if (mounted) setState(() => _association = value);
@@ -65,7 +69,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _updateStatus = result.failed
           ? '检查失败，请稍后再试'
           : info == null
-              ? '已是最新版本'
+              ? '已是最新版本（当前 $appVersion）'
               : '发现新版本 ${info.version}';
     });
     if (info != null) {
@@ -103,6 +107,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
     return ContentFrame(
       scrollable: true,
+      maxWidth: AppSizes.settingsContentWidth,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -172,7 +177,7 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
               _SettingRow(
                 label: '预加载数量',
-                subtitle: '当前内容之后预先缓冲的剧/集数，越大切换越快',
+                subtitle: '当前内容之后预先请求播放计划与索引的数量；不会额外启动播放器',
                 trailing: DropdownButtonHideUnderline(
                   child: DropdownButton<int>(
                     value: settings.preloadAhead,
@@ -304,13 +309,15 @@ class _SettingsPageState extends State<SettingsPage> {
               _SettingRow(
                 label: AppStrings.settingsDownloadDir,
                 subtitle: settings.downloadDirectory,
-                trailing: TextButton(
-                  onPressed: () => _editDownloadDirectory(
-                    controller,
-                    settings.downloadDirectory,
-                  ),
-                  child: const Text(AppStrings.settingsEdit),
-                ),
+                trailing: isMobilePlatform
+                    ? null
+                    : TextButton(
+                        onPressed: () => _editDownloadDirectory(
+                          controller,
+                          settings.downloadDirectory,
+                        ),
+                        child: const Text(AppStrings.settingsEdit),
+                      ),
               ),
             ],
           ),
@@ -336,31 +343,36 @@ class _SettingsPageState extends State<SettingsPage> {
                       : '$count 个文件 · ${_mb(manager.totalBytes)}';
                 }(),
                 trailing: TextButton(
+                  style: TextButton.styleFrom(
+                    foregroundColor: tokens.colors.danger,
+                  ),
                   onPressed: () => _clearDownloads(context),
                   child: const Text('清空'),
                 ),
               ),
             ],
           ),
-          _Section(
-            title: AppStrings.settingsFileAssoc,
-            children: [
-              _SwitchRow(
-                label: AppStrings.settingsFileAssoc,
-                subtitle: AppStrings.fileAssocNote,
-                value: _association,
-                onChanged: (value) => _toggleAssociation(scope, value),
-              ),
-              _SettingRow(
-                label: '',
-                subtitle: null,
-                trailing: TextButton(
-                  onPressed: () => scope.fileAssociation.openSystemDefaultApps(),
-                  child: const Text(AppStrings.openSystemSettings),
+          if (isDesktopPlatform)
+            _Section(
+              title: AppStrings.settingsFileAssoc,
+              children: [
+                _SwitchRow(
+                  label: AppStrings.settingsFileAssoc,
+                  subtitle: AppStrings.fileAssocNote,
+                  value: _association,
+                  onChanged: (value) => _toggleAssociation(scope, value),
                 ),
-              ),
-            ],
-          ),
+                _SettingRow(
+                  label: '系统默认应用',
+                  subtitle: '在 Windows 设置里更改 .mp4 / .mkv 的打开方式',
+                  trailing: TextButton(
+                    onPressed: () =>
+                        scope.fileAssociation.openSystemDefaultApps(),
+                    child: Text(AppStrings.openSystemSettings),
+                  ),
+                ),
+              ],
+            ),
           _Section(
             title: '关于',
             children: [
@@ -388,38 +400,40 @@ class _SettingsPageState extends State<SettingsPage> {
               _SettingRow(
                 label: '当前版本',
                 subtitle: '$appVersion · $updateChannelLabel',
-                trailing: TextButton(
-                  onPressed:
-                      _checkingUpdate ? null : () => _checkUpdate(controller),
-                  child: Text(_checkingUpdate ? '检查中…' : '检查更新'),
-                ),
+                trailing: isMobilePlatform
+                    ? null
+                    : TextButton(
+                        onPressed: _checkingUpdate
+                            ? null
+                            : () => _checkUpdate(controller),
+                        child: Text(_checkingUpdate ? '检查中…' : '检查更新'),
+                      ),
               ),
+              if (isMobilePlatform)
+                const _SettingRow(
+                  label: 'Android 版',
+                  subtitle: '新版本请从官网下载安装包覆盖安装',
+                  trailing: null,
+                ),
               if (_updateStatus != null)
                 _SettingRow(label: '', subtitle: _updateStatus, trailing: null),
             ],
           ),
-          _Section(
-            title: AppStrings.settingsDecryptors,
-            children: [
-              _SettingRow(
-                label: AppStrings.settingsDecryptorDir,
-                subtitle: scope.decryptorRegistry.directory.path,
-                trailing: TextButton(
-                  onPressed: _scanDecryptors,
-                  child: const Text(AppStrings.settingsRefresh),
+          if (isDesktopPlatform)
+            _Section(
+              title: AppStrings.settingsDecryptors,
+              children: [
+                _SettingRow(
+                  label: AppStrings.settingsDecryptorDir,
+                  subtitle: scope.decryptorRegistry.directory.path,
+                  trailing: TextButton(
+                    onPressed: _scanDecryptors,
+                    child: const Text(AppStrings.settingsRefresh),
+                  ),
                 ),
-              ),
-              _decryptorList(context, tokens),
-            ],
-          ),
-          const SizedBox(height: AppSpacing.x4),
-          Text(
-            '版本 $appVersion · $updateChannelLabel',
-            style: TextStyle(
-              fontSize: AppFontSize.xxs,
-              color: tokens.colors.text3,
+                _decryptorList(context, tokens),
+              ],
             ),
-          ),
         ],
       ),
     );

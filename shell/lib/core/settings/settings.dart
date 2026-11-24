@@ -14,7 +14,9 @@ class AppSettings {
   const AppSettings({
     required this.clientId,
     this.themeMode = ThemeMode.system,
-    this.defaultQuality = Quality.auto,
+    // Short dramas top out at 1080p upstream; pin it instead of settling for
+    // whatever a source happens to list first.
+    this.defaultQuality = '1080p',
     this.downloadQuality = Quality.auto,
     this.maxConcurrentDownloads = 3,
     this.downloadSegments = 6,

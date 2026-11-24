@@ -94,12 +94,18 @@ class PreviewSourceApi implements SourceApi {
       expiresAt: _plan.expiresAt,
       nextEpisodeId: _plan.nextEpisodeId,
       downgraded: _plan.downgraded,
+      durationMs: _plan.durationMs,
       extra: _plan.extra,
     );
   }
 
   @override
-  Future<ItemPage> feed({String channel = '', String cursor = '', int limit = 20}) async =>
+  Future<ItemPage> feed({
+    String channel = '',
+    String cursor = '',
+    int limit = 20,
+    bool refresh = false,
+  }) async =>
       ItemPage(items: _items);
 
   @override

@@ -1,13 +1,25 @@
 import 'dart:convert';
 import 'dart:io';
 
-/// Native open dialogs, taken from the Windows shell. The app ships for
-/// Windows only, and doing it this way avoids a picker plugin whose
-/// transitive `cross_file` version clashes with the drop target's.
-abstract final class LocalDialogs {
-  static Future<String?> pickFile() => _pick(_fileScript);
+import '../platform/android_host.dart';
+import '../platform/platform.dart';
 
-  static Future<String?> pickFolder() => _pick(_folderScript);
+/// Native open dialogs: the Windows shell dialog on desktop, the Storage
+/// Access Framework picker on Android. Doing it this way avoids a picker
+/// plugin whose transitive `cross_file` version clashes with the drop
+/// target's.
+abstract final class LocalDialogs {
+  static Future<String?> pickFile() {
+    if (isAndroidPlatform) return AndroidHost.pickVideos();
+    return _pick(_fileScript);
+  }
+
+  static Future<String?> pickFolder() {
+    // Android's picker returns a folder of copies for a multi-selection;
+    // open-folder stays a desktop action.
+    if (isMobilePlatform) return Future.value(null);
+    return _pick(_folderScript);
+  }
 
   static Future<String?> _pick(
     String Function(String outPath) build,

@@ -9,6 +9,7 @@ import '../gateway/gateway_errors.dart';
 import '../gateway/source_api.dart';
 import '../library/local_library.dart';
 import '../local/local_media.dart';
+import '../platform/platform.dart';
 import '../sp/models.dart';
 import '../storage/paths.dart';
 import '../sp/quality.dart';
@@ -238,35 +239,26 @@ class _LibraryPageState extends State<LibraryPage> {
         .where((record) => !hidden.contains(record.seriesKey))
         .toList(growable: false);
     if (api == null || widget.type == PageTypes.libraryDownloads) return local;
+    // A signed-in shelf is the account's, not this device's: no local rows and
+    // no local-only progress are mixed in. Signed out, the local shelf stays
+    // the only source.
+    final cloudOnly = !controller.localMode && controller.loggedIn;
     try {
       final page = favorites
           ? await api.favorites(cursor: '', limit: 50)
           : await api.history(limit: 50);
-      final merged = <String, LibraryRecord>{
-        for (final record in local) record.seriesKey: record,
-      };
-      final localKeys = merged.keys.toSet();
-      final remoteKeys = <String>{};
+      final merged = <String, LibraryRecord>{};
+      final cloud = <LibraryRecord>[];
       for (final item in page.items) {
         final key = '${api.sourceId}:${item.id}';
         if (hidden.contains(key)) continue;
-        remoteKeys.add(key);
-        final existing = merged[key];
-        if (existing != null) {
-          if (widget.type == PageTypes.libraryHistory &&
-              existing.episodeId.isEmpty) {
-            merged[key] = _remoteRecord(api.sourceId, item, existing);
-          } else {
-            // The account shelf carries the current artwork; a record saved
-            // from a list or a player frame can hold an older cover.
-            merged[key] = existing.copyWith(
-              title: item.title.trim().isEmpty ? null : item.title,
-              cover: item.cover.trim().isEmpty ? null : item.cover,
-            );
-          }
-          continue;
-        }
-        merged[key] = _remoteRecord(api.sourceId, item, null);
+        final record = _remoteRecord(api.sourceId, item, null);
+        merged[key] = record;
+        cloud.add(record);
+      }
+      if (cloudOnly) return cloud;
+      for (final record in local) {
+        merged.putIfAbsent(record.seriesKey, () => record);
       }
       if (favorites) return merged.values.toList(growable: false);
       // Only this device knows how far an episode really was played; the
@@ -281,15 +273,12 @@ class _LibraryPageState extends State<LibraryPage> {
             finished: local.position >= local.duration - 3,
           );
         }
-        if (remoteKeys.contains(record.seriesKey) &&
-            !localKeys.contains(record.seriesKey)) {
-          // The account's duration is not a per-episode length; without a
-          // local position the bar would be fiction.
-          return record.copyWith(positionSec: 0, durationSec: 0);
-        }
-        return record;
+        return record.copyWith(positionSec: 0, durationSec: 0);
       }).toList(growable: false);
     } on Object {
+      // With an account the cloud list is the only truth; do not replace a
+      // failed request with this device's private history.
+      if (cloudOnly) rethrow;
       return local;
     }
   }
@@ -1418,6 +1407,11 @@ class _LibraryPageState extends State<LibraryPage> {
     final path = settings.downloadDirectory.trim().isEmpty
         ? defaultDownloadDirectory()
         : settings.downloadDirectory;
+    if (isMobilePlatform) {
+      // Android has no file-manager intent for app-specific storage.
+      _snack('下载目录：$path');
+      return;
+    }
     await AppScope.of(context).fileAssociation.openFolder(path);
   }
 

@@ -14,7 +14,7 @@ import 'local_thumbs.dart';
 /// goes straight to the image CDN.
 class RemoteCover {
   static const int _maxBytes = 8 * 1024 * 1024;
-  static const int _maxParallel = 3;
+  static const int _maxParallel = 2;
 
   static final Map<String, String> _paths = {};
   static final Set<String> _failed = {};
@@ -107,16 +107,21 @@ class RemoteCover {
   static Future<String?> _build(String url, String key) async {
     final jpg = File(joinPath(_dir.path, '$key.jpg'));
     if (jpg.existsSync() && jpg.lengthSync() > 0) return jpg.path;
-    final ffmpeg = LocalThumbs.tool('ffmpeg');
-    if (ffmpeg == null) return null;
     await _acquire();
     final source = File(joinPath(_dir.path, '$key.src'));
     try {
-      if (!source.existsSync() || source.lengthSync() == 0) {
-        final bytes = await _download(url);
-        if (bytes == null) return null;
-        await source.writeAsBytes(bytes, flush: true);
+      final bytes = await _download(url);
+      if (bytes == null) return null;
+      // A fallback can also fire on a transient network error for an image
+      // Flutter could decode all along. Writing JPEG/PNG bytes straight to
+      // the cache avoids spawning ffmpeg for those.
+      if (_isJpegOrPng(bytes)) {
+        await jpg.writeAsBytes(bytes, flush: true);
+        return jpg.path;
       }
+      final ffmpeg = LocalThumbs.tool('ffmpeg');
+      if (ffmpeg == null) return null;
+      await source.writeAsBytes(bytes, flush: true);
       final portrait = Uri.tryParse(url)?.queryParameters['fit'] == 'portrait';
       final result = await Process.run(ffmpeg, [
         '-y',
@@ -126,15 +131,15 @@ class RemoteCover {
         source.path,
         '-frames:v',
         '1',
-        if (portrait)
-          ...['-vf', 'crop=min(iw\\,ih*3/4):min(ih\\,iw*4/3),scale=400:-2'],
+        if (portrait) ...[
+          '-vf',
+          'crop=min(iw\\,ih*3/4):min(ih\\,iw*4/3),scale=400:-2'
+        ],
         '-q:v',
         '4',
         jpg.path,
       ]);
-      if (result.exitCode != 0 ||
-          !jpg.existsSync() ||
-          jpg.lengthSync() == 0) {
+      if (result.exitCode != 0 || !jpg.existsSync() || jpg.lengthSync() == 0) {
         debugPrint('cover convert failed: ${result.stderr}');
         return null;
       }
@@ -150,12 +155,22 @@ class RemoteCover {
     }
   }
 
+  static bool _isJpegOrPng(List<int> bytes) {
+    if (bytes.length < 4) return false;
+    if (bytes[0] == 0xFF && bytes[1] == 0xD8) return true;
+    return bytes[0] == 0x89 &&
+        bytes[1] == 0x50 &&
+        bytes[2] == 0x4E &&
+        bytes[3] == 0x47;
+  }
+
   static Future<List<int>?> _download(String url) async {
     final uri = Uri.tryParse(url);
     if (uri == null) return null;
     final src = uri.queryParameters['src'];
     final target = src != null && src.isNotEmpty ? Uri.parse(src) : uri;
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 12);
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 12);
     try {
       final request = await client.getUrl(target);
       request.headers.set(HttpHeaders.userAgentHeader, 'Dart/3.9 (dart:io)');

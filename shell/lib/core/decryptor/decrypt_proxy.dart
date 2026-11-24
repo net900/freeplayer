@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -9,6 +10,10 @@ import 'cenc_native.dart';
 /// asks this server for bytes (with Range), the proxy pulls the ciphertext
 /// from the API and decrypts it with cenc_decrypt.dll.
 ///
+/// The server, the MP4 index and every decryption call run in a dedicated
+/// isolate. Decrypting a few megabytes synchronously used to happen on the UI
+/// isolate, which is exactly what produced hitches while scrubbing.
+///
 /// The API never decrypts in this mode and the client never writes a full
 /// decrypted copy to disk: only the requested ranges are decrypted in memory.
 class DecryptProxy {
@@ -16,11 +21,155 @@ class DecryptProxy {
 
   static final DecryptProxy instance = DecryptProxy._();
 
+  /// Builds a proxy entry for an episode that is only queued: opening it
+  /// probes the size and fetches the moov window from the CDN, which then no
+  /// longer happens during the switch.
+  static void warm(String url, String keyHex) {
+    if (url.isEmpty || keyHex.isEmpty) return;
+    unawaited(() async {
+      try {
+        await instance.register(url, keyHex);
+      } on Object {
+        // The real open registers again and reports its own failure.
+      }
+    }());
+  }
+
+  SendPort? _calls;
+  Future<SendPort>? _starting;
+  final Map<int, Completer<Object?>> _pending = {};
+  int _nextId = 0;
+
+  /// UA the reference client sends when pulling media directly from the CDN.
+  static const String videoUserAgent =
+      'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; '
+      'Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 '
+      'QuicVersion:c67e9834 2025-09-08)';
+
+  /// Direct-pull headers shared with the mpv path: the CDN sees the video UA
+  /// and `identity` keeps the MP4 bytes uncompressed.
+  static Map<String, String> mediaHeaders(Uri uri) => {
+        HttpHeaders.userAgentHeader: videoUserAgent,
+        HttpHeaders.acceptEncodingHeader: 'identity',
+      };
+
+  Future<SendPort> _ensureWorker() {
+    final calls = _calls;
+    if (calls != null) return Future.value(calls);
+    final starting = _starting;
+    if (starting != null) return starting;
+    final future = _start();
+    _starting = future;
+    return future;
+  }
+
+  Future<SendPort> _start() async {
+    final replies = ReceivePort();
+    final ready = Completer<SendPort>();
+    replies.listen(
+      (message) {
+        if (message is List && message.isNotEmpty && message[0] == 'exit') {
+          _failPending();
+          if (!ready.isCompleted) {
+            ready.completeError(StateError('解密进程已停止'));
+          }
+          return;
+        }
+        if (message is! List || message.length < 2) return;
+        if (message[0] == 'ready') {
+          final port = message[1] as SendPort;
+          _calls = port;
+          if (!ready.isCompleted) ready.complete(port);
+          return;
+        }
+        if (message[0] == 'reply') {
+          final id = message[1] as int;
+          final pending = _pending.remove(id);
+          if (pending == null) return;
+          if (message[2] == true) {
+            pending.complete(message[3]);
+          } else {
+            pending.completeError(StateError('${message[3]}'));
+          }
+        }
+      },
+      onDone: _failPending,
+    );
+    try {
+      final isolate = await Isolate.spawn(
+        _proxyWorkerMain,
+        replies.sendPort,
+        debugName: 'fp-decrypt-proxy',
+      );
+      isolate.addOnExitListener(replies.sendPort, response: const ['exit']);
+    } on Object catch (error, stack) {
+      _starting = null;
+      if (!ready.isCompleted) ready.completeError(error, stack);
+    }
+    return ready.future;
+  }
+
+  void _failPending() {
+    _calls = null;
+    _starting = null;
+    final error = StateError('解密进程已停止');
+    for (final pending in _pending.values) {
+      if (!pending.isCompleted) pending.completeError(error);
+    }
+    _pending.clear();
+  }
+
+  Future<Object?> _send(String operation, List<Object?> args) async {
+    final calls = await _ensureWorker();
+    final id = ++_nextId;
+    final completer = Completer<Object?>();
+    _pending[id] = completer;
+    calls.send(['call', id, operation, ...args]);
+    return completer.future;
+  }
+
+  /// Registers an encrypted URL and returns the loopback URL to play.
+  Future<String> register(String url, String keyHex) async {
+    final result = await _send('register', [url, keyHex]);
+    return result as String;
+  }
+}
+
+// ---------------------------------------------------------------- worker
+
+Future<void> _proxyWorkerMain(SendPort reply) async {
+  final calls = ReceivePort();
+  final registry = _ProxyRegistry();
+  reply.send(['ready', calls.sendPort]);
+  await for (final message in calls) {
+    if (message is! List || message.length < 3) continue;
+    final id = message[1] as int;
+    try {
+      if (message[0] != 'call') continue;
+      final operation = message[2] as String;
+      if (operation == 'register') {
+        final url = message[3] as String;
+        final key = message[4] as String;
+        final result = await registry.register(url, key);
+        reply.send(['reply', id, true, result]);
+      } else if (operation == 'available') {
+        reply.send(['reply', id, true, _ProxyRegistry.available]);
+      } else {
+        reply.send(['reply', id, false, '未知解密操作']);
+      }
+    } on Object catch (error) {
+      reply.send(['reply', id, false, '$error']);
+    }
+  }
+}
+
+class _ProxyRegistry {
   static const int _maxEntries = 8;
-  /// Entries idle for longer than this are dropped on the next registration.
   static const Duration _idleTtl = Duration(minutes: 10);
   static const int _firstHop = 256 * 1024;
   static const int _hop = 2 * 1024 * 1024;
+
+  static bool get available => CencNative.ensureLoaded() != null;
 
   final HttpClient _client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 15)
@@ -28,12 +177,9 @@ class DecryptProxy {
 
   final Map<String, _ProxyMedia> _media = {};
   final Map<String, String> _bySource = {};
-  final List<String> _order = [];
   HttpServer? _server;
   Future<int>? _starting;
   int _sequence = 0;
-
-  bool get available => CencNative.ensureLoaded() != null;
 
   /// Registers an encrypted URL and returns the loopback URL to play.
   ///
@@ -62,19 +208,46 @@ class DecryptProxy {
         .toList();
     for (final old in stale) {
       _media.remove(old)?.dispose();
-      _order.remove(old);
       _bySource.removeWhere((_, value) => value == old);
     }
     _media[id] = media;
     _bySource[sourceKey] = id;
-    _order.add(id);
-    while (_order.length > _maxEntries) {
-      final old = _order.removeAt(0);
-      _media.remove(old)?.dispose();
-      _bySource.removeWhere((_, value) => value == old);
-    }
+    _evictIfNeeded();
     final port = await _ensureServer();
     return 'http://127.0.0.1:$port/v/$id';
+  }
+
+  /// Keeps the registry bounded without dropping the stream that is playing
+  /// right now. Entries touched in the last 30 seconds are protected; only
+  /// when every entry is hot does the least recently used one go. Eviction
+  /// used to follow insertion order, so a burst of preloads could remove the
+  /// entry whose ranges the player was still requesting.
+  void _evictIfNeeded() {
+    if (_media.length <= _maxEntries) return;
+    final now = DateTime.now();
+    String? victim;
+    DateTime? oldest;
+    for (final entry in _media.entries) {
+      if (now.difference(entry.value.lastUsed) < const Duration(seconds: 30)) {
+        continue;
+      }
+      if (oldest == null || entry.value.lastUsed.isBefore(oldest)) {
+        oldest = entry.value.lastUsed;
+        victim = entry.key;
+      }
+    }
+    if (victim == null) {
+      for (final entry in _media.entries) {
+        if (oldest == null || entry.value.lastUsed.isBefore(oldest)) {
+          oldest = entry.value.lastUsed;
+          victim = entry.key;
+        }
+      }
+    }
+    if (victim == null) return;
+    _media.remove(victim)?.dispose();
+    _bySource.removeWhere((_, value) => value == victim);
+    _evictIfNeeded();
   }
 
   Future<int> _ensureServer() {
@@ -130,7 +303,8 @@ class DecryptProxy {
       response.statusCode = partial ? HttpStatus.partialContent : HttpStatus.ok;
       response.headers.set(HttpHeaders.contentTypeHeader, 'video/mp4');
       response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-      response.headers.set(HttpHeaders.contentLengthHeader, '${end - start + 1}');
+      response.headers
+          .set(HttpHeaders.contentLengthHeader, '${end - start + 1}');
       if (partial) {
         response.headers.set(
           HttpHeaders.contentRangeHeader,
@@ -160,7 +334,14 @@ class DecryptProxy {
         if (plain.isEmpty) break;
         final from = cursor - span.start;
         final to = math.min(chunkEnd, span.end) - span.start + 1;
-        if (to > from) response.add(plain.sublist(from, to));
+        if (to > from) {
+          // A view, not a copy: the plaintext buffer is already fresh.
+          response.add(Uint8List.sublistView(plain, from, to));
+          // Wait for the socket before decrypting the next hop. Without this
+          // the proxy raced ahead of the player, decrypting the rest of the
+          // file into memory.
+          await response.flush();
+        }
         cursor = math.min(chunkEnd, span.end) + 1;
       }
       await response.close();
@@ -208,6 +389,10 @@ class _ProxyMedia {
   final int size;
   final CencIndex _index;
   Uint8List? _whole;
+  // The head fetched while locating moov is kept: the player asks for exactly
+  // that range next, and serving it from memory saves a CDN round trip on
+  // every open and episode switch.
+  Uint8List? _head;
   DateTime lastUsed = DateTime.now();
 
   static Future<_ProxyMedia> open(
@@ -216,19 +401,28 @@ class _ProxyMedia {
     String url,
     Uint8List key,
   ) async {
-    final size = await _size(client, url);
-    if (size <= 0) throw StateError('无法获取视频大小');
+    // Size discovery and the first head fetch run together: waiting for the
+    // HEAD round trip before every episode switch was the bulk of the
+    // one-second delay between episodes.
+    final sizeProbe = _size(client, url);
     Uint8List? whole;
     CencIndex? index;
     // A 200 answer already contains the whole file: retrying larger windows
     // would download it again for nothing.
     var complete = false;
+    var size = 0;
+    Uint8List? head;
     for (final window in [256 << 10, 2 << 20, 8 << 20]) {
-      final end = math.min(window, size) - 1;
+      final end = size > 0 ? math.min(window, size) - 1 : window - 1;
       final got = await _get(client, url, 0, end);
+      if (size <= 0) {
+        size = await sizeProbe;
+        if (size <= 0) throw StateError('无法获取视频大小');
+      }
       complete = got.status == HttpStatus.ok && got.bytes.length >= size;
       if (complete && size <= _wholeMax) whole = got.bytes;
       final data = complete ? _slice(got.bytes, 0, end) : got.bytes;
+      head ??= data;
       index = native.createIndex(data, base: 0, fileSize: size);
       if (index != null || window >= size || complete) break;
     }
@@ -249,17 +443,23 @@ class _ProxyMedia {
     }
     final media = _ProxyMedia._(client, url, key, size, index);
     media._whole = whole;
+    media._head = head;
     return media;
   }
 
   ({int start, int end}) span(int start, int end) => _index.span(start, end);
 
-  Uint8List decrypt(Uint8List data, int start) => _index.decrypt(data, start, _key);
+  Uint8List decrypt(Uint8List data, int start) =>
+      _index.decrypt(data, start, _key);
 
   Future<Uint8List> fetch(int start, int end) async {
     lastUsed = DateTime.now();
     final whole = _whole;
     if (whole != null) return _slice(whole, start, end);
+    final head = _head;
+    if (head != null && start < head.length && end < head.length) {
+      return _slice(head, start, end);
+    }
     final got = await _get(_client, _url, start, end);
     if (got.status == HttpStatus.ok) {
       // Range was ignored: the body starts at offset 0, not at [start].
@@ -283,8 +483,14 @@ class _ProxyMedia {
   }
 
   static Future<int> _size(HttpClient client, String url) async {
+    final uri = Uri.parse(url);
     try {
-      final request = await client.openUrl('HEAD', Uri.parse(url));
+      final request = await client.openUrl('HEAD', uri);
+      request.headers.set(
+        HttpHeaders.userAgentHeader,
+        DecryptProxy.videoUserAgent,
+      );
+      request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
       final response = await request.close();
       final length = response.contentLength;
       await response.drain<void>();
@@ -292,13 +498,42 @@ class _ProxyMedia {
     } on Object {
       // Fall through to a one-byte range request.
     }
-    final request = await client.openUrl('GET', Uri.parse(url));
-    request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-0');
-    final response = await request.close();
+    var response = await _openMediaGet(client, uri, 0, 0);
+    if (response.statusCode == HttpStatus.forbidden) {
+      await response.drain<void>();
+      response = await _openMediaGet(client, uri, 0, 0, withReferer: true);
+    }
     final range = response.headers.value(HttpHeaders.contentRangeHeader) ?? '';
     await response.drain<void>();
     final match = RegExp(r'/(\d+)\s*$').firstMatch(range);
     return int.tryParse(match?.group(1) ?? '') ?? 0;
+  }
+
+  /// A range GET with the media headers. [withReferer] is the one-shot retry
+  /// for edges that answer 403 until a Referer is present.
+  static Future<HttpClientResponse> _openMediaGet(
+    HttpClient client,
+    Uri uri,
+    int start,
+    int end, {
+    bool withReferer = false,
+  }) async {
+    final request = await client.openUrl('GET', uri);
+    request.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
+    request.headers.set(
+      HttpHeaders.userAgentHeader,
+      DecryptProxy.videoUserAgent,
+    );
+    request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+    if (withReferer) {
+      final referer = uri.hasScheme && uri.host.isNotEmpty
+          ? '${uri.scheme}://${uri.host}/'
+          : null;
+      if (referer != null) {
+        request.headers.set(HttpHeaders.refererHeader, referer);
+      }
+    }
+    return request.close();
   }
 
   static Future<({Uint8List bytes, int status})> _get(
@@ -307,9 +542,14 @@ class _ProxyMedia {
     int start,
     int end,
   ) async {
-    final request = await client.openUrl('GET', Uri.parse(url));
-    request.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
-    final response = await request.close();
+    final uri = Uri.parse(url);
+    var response = await _openMediaGet(client, uri, start, end);
+    if (response.statusCode == HttpStatus.forbidden) {
+      // Some edges only answer once a Referer is present; retry exactly once.
+      await response.drain<void>();
+      response =
+          await _openMediaGet(client, uri, start, end, withReferer: true);
+    }
     if (response.statusCode != HttpStatus.ok &&
         response.statusCode != HttpStatus.partialContent) {
       await response.drain<void>();

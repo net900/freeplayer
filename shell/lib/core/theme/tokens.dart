@@ -23,6 +23,12 @@ class AppColors {
     required this.badgeHot,
     required this.glass,
     required this.glassBorder,
+    required this.glassStrong,
+    required this.glassStrongBorder,
+    required this.like,
+    required this.favorite,
+    required this.local,
+    required this.onImageAccent,
   });
 
   final Color bg;
@@ -49,6 +55,24 @@ class AppColors {
   final Color glass;
   final Color glassBorder;
 
+  /// Opaque-enough glass for chrome that sits directly over video, where the
+  /// regular [glass] tint is too transparent to keep 11–15 px text readable.
+  final Color glassStrong;
+  final Color glassStrongBorder;
+
+  /// Interaction colours shared by the feed, player and detail actions.
+  final Color like;
+  final Color favorite;
+  final Color local;
+
+  /// Accent used for metadata drawn over artwork (feed categories).
+  final Color onImageAccent;
+
+  /// Dark glass for chrome that always sits on video, regardless of the app
+  /// theme. Exposed as static constants so const widgets can reference them.
+  static const Color darkGlassStrong = Color(0xB3000000);
+  static const Color darkGlassStrongBorder = Color(0x33FFFFFF);
+
   static AppColors lerp(AppColors a, AppColors b, double t) {
     return AppColors(
       bg: Color.lerp(a.bg, b.bg, t)!,
@@ -69,6 +93,13 @@ class AppColors {
       badgeHot: Color.lerp(a.badgeHot, b.badgeHot, t)!,
       glass: Color.lerp(a.glass, b.glass, t)!,
       glassBorder: Color.lerp(a.glassBorder, b.glassBorder, t)!,
+      glassStrong: Color.lerp(a.glassStrong, b.glassStrong, t)!,
+      glassStrongBorder:
+          Color.lerp(a.glassStrongBorder, b.glassStrongBorder, t)!,
+      like: Color.lerp(a.like, b.like, t)!,
+      favorite: Color.lerp(a.favorite, b.favorite, t)!,
+      local: Color.lerp(a.local, b.local, t)!,
+      onImageAccent: Color.lerp(a.onImageAccent, b.onImageAccent, t)!,
     );
   }
 
@@ -92,6 +123,12 @@ class AppColors {
       badgeHot: badgeHot,
       glass: glass,
       glassBorder: glassBorder,
+      glassStrong: glassStrong,
+      glassStrongBorder: glassStrongBorder,
+      like: like,
+      favorite: favorite,
+      local: local,
+      onImageAccent: onImageAccent,
     );
   }
 
@@ -103,9 +140,12 @@ class AppColors {
     border: Color(0xFF282E37),
     text: Color(0xFFECEEF2),
     text2: Color(0xFFA2AAB8),
-    text3: Color(0xFF6C7482),
-    accent: Color(0xFFE8453C),
-    accentWeak: Color(0x24E8453C),
+    // 4.5:1 on bg at the 11 px badge size; the previous #6C7482 measured ~4.0.
+    text3: Color(0xFF7F8896),
+    // Darkened from #E8453C so white button text reaches AA (~4.6:1) and the
+    // brand red stops reading as another app's accent.
+    accent: Color(0xFFD93A31),
+    accentWeak: Color(0x24D93A31),
     danger: Color(0xFFF05252),
     success: Color(0xFF3DBE7A),
     badgeNew: Color(0xFF34C77B),
@@ -114,6 +154,12 @@ class AppColors {
     badgeHot: Color(0xFFFF7A45),
     glass: Color(0x4D000000),
     glassBorder: Color(0x40FFFFFF),
+    glassStrong: darkGlassStrong,
+    glassStrongBorder: darkGlassStrongBorder,
+    like: Color(0xFFFF5A6E),
+    favorite: Color(0xFFFFC24B),
+    local: Color(0xFF4BD9A4),
+    onImageAccent: Color(0xFFFFD8A8),
   );
 
   static const AppColors light = AppColors(
@@ -124,7 +170,8 @@ class AppColors {
     border: Color(0xFFDDE1E7),
     text: Color(0xFF14181D),
     text2: Color(0xFF5B6472),
-    text3: Color(0xFF8C95A3),
+    // Darkened from #8C95A3; that measured ~2.8:1 on this background.
+    text3: Color(0xFF69717F),
     accent: Color(0xFFD63A31),
     accentWeak: Color(0x1AD63A31),
     danger: Color(0xFFD92D20),
@@ -135,6 +182,12 @@ class AppColors {
     badgeHot: Color(0xFFD9480F),
     glass: Color(0x40FFFFFF),
     glassBorder: Color(0x26000000),
+    glassStrong: Color(0xF2FFFFFF),
+    glassStrongBorder: Color(0x1F000000),
+    like: Color(0xFFE5484D),
+    favorite: Color(0xFFB07B18),
+    local: Color(0xFF0F9D58),
+    onImageAccent: Color(0xFFFFD8A8),
   );
 }
 
@@ -163,7 +216,9 @@ abstract final class AppFontSize {
   static const double bodyLg = 15;
   static const double title = 17;
   static const double h1 = 21;
+  static const double h3 = 22;
   static const double h2 = 24;
+  static const double display = 28;
 }
 
 abstract final class AppLineHeight {
@@ -179,6 +234,7 @@ abstract final class AppDuration {
 }
 
 abstract final class AppSizes {
+  static const double titleBar = 36;
   static const double topBar = 56;
   static const double sidebar = 232;
   static const double sidebarCollapsed = 68;
@@ -191,6 +247,10 @@ abstract final class AppSizes {
   static const double drawerWidth = 820;
   static const double posterAspect = 3 / 4;
   static const double playerAspect = 16 / 9;
+  /// Browsing pages centre their content past this width instead of letting
+  /// rows run edge to edge on 2K/4K monitors.
+  static const double maxContentWidth = 1280;
+  static const double settingsContentWidth = 980;
 }
 
 /// Standard shadow values from PRD §5.7.2.

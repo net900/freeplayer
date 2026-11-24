@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
+import '../core/decryptor/cenc_native.dart';
 import '../core/decryptor/decryptor_registry.dart';
 import '../core/downloads/download_manager.dart';
 import '../core/gateway/core_download.dart';
@@ -10,8 +13,10 @@ import '../core/local_source/local_sources_service.dart';
 import '../core/local/file_association.dart';
 import '../core/local/url_scheme.dart';
 import '../core/pages/page_builders.dart';
+import '../core/platform/platform.dart';
 import '../core/renderer/page_registry.dart';
 import '../core/settings/settings_store.dart';
+import '../core/storage/library_db.dart';
 import '../core/storage/local_store.dart';
 import '../core/storage/paths.dart';
 import '../core/gateway/gateway_store.dart';
@@ -50,18 +55,35 @@ class AppServices {
 }
 
 Future<AppServices> bootstrap() async {
+  await initPlatformDirectories();
+  if (isAndroidPlatform) {
+    // Probe the packaged decryptor once so a packaging regression shows in
+    // logcat instead of only when an encrypted episode is opened.
+    final cenc = CencNative.ensureLoaded();
+    debugPrint('freeplayer android cenc: ${cenc == null ? 'unavailable' : 'loaded'}');
+  }
   // Before anything loads a DLL, finish deletions left by a source removed
   // while its module was still mapped in the previous session.
   final decryptorRegistry = DecryptorRegistry();
   await decryptorRegistry.cleanupPendingRemoval();
-  await CoreDownload().cleanupPendingRemoval();
+  if (isDesktopPlatform) {
+    // The core is a Windows DLL installed beside the executable; mobile has
+    // no such file to clean up.
+    await CoreDownload().cleanupPendingRemoval();
+  }
   final controller = AppController(
     settingsStore: SettingsStore.createDefault(),
     gatewayStore: GatewayStore(LocalStore(appDataFile('gateways.json'))),
     decryptors: decryptorRegistry,
   );
   await controller.init();
-  final library = LocalLibrary(LocalStore(appDataFile('library.json')));
+  // SQLite (Windows built-in) replaces the single JSON file that was
+  // re-encoded on every progress tick; the JSON store stays as a fallback
+  // and its contents are imported once.
+  final library = LocalLibrary(
+    LocalStore(appDataFile('library.json')),
+    db: LibraryDb.open(appDataFile('library.db').path),
+  );
   final downloads = DownloadManager(
     library: library,
     settings: () => controller.settings,
@@ -150,6 +172,7 @@ Future<bool> installSourceCore(AppServices services) async {
 /// Removes the core DLL with its source. The in-process library cannot be
 /// unloaded, so a locked file is retried on the next launch.
 Future<void> removeSourceCore(AppServices services) async {
+  if (!isDesktopPlatform) return;
   services.localCore.stop();
   await CoreDownload().removeInstalled();
 }
@@ -173,9 +196,18 @@ Future<void> startCore(AppServices services) async {
   if (LocalCore.findLibrary() == null) {
     // Recovery, not a routine download: the source is installed but its core
     // is gone. Progress is shown because this is ~10 MB.
-    await installSourceCore(services);
+    controller.setCoreStarting(true);
+    try {
+      await installSourceCore(services);
+    } finally {
+      controller.setCoreStarting(false);
+    }
     return;
   }
+  // The update check must run before the DLL is loaded: Windows cannot replace
+  // a mapped DLL, so updating a running core would fail. While the check and
+  // the start run, pages wait instead of calling the previous session's port.
+  controller.setCoreStarting(true);
   controller.beginUpdatePass();
   var updating = false;
   var replaced = false;
@@ -196,5 +228,6 @@ Future<void> startCore(AppServices services) async {
   } finally {
     if (updating) controller.endSourceUpdate(coreUpdateName, updated: replaced);
     controller.endUpdatePass();
+    controller.setCoreStarting(false);
   }
 }

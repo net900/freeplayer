@@ -8,6 +8,15 @@ class PageTitleController {
   final ValueNotifier<bool> _hideTitle = ValueNotifier<bool>(false);
   final List<_TitleNode> _nodes = <_TitleNode>[];
 
+  /// True while the page behind the title bar is the immersive home feed:
+  /// the window chrome turns transparent and the content runs underneath it.
+  final ValueNotifier<bool> overMedia = ValueNotifier<bool>(false);
+
+  /// True while the full-window player is on screen. The player is pushed on
+  /// the root navigator, so the home feed underneath cannot speak for what the
+  /// chrome is floating over.
+  final ValueNotifier<bool> overVideo = ValueNotifier<bool>(false);
+
   ValueListenable<String> get listenable => _title;
   ValueListenable<bool> get hideTitle => _hideTitle;
   String get value => _title.value;
@@ -71,6 +80,7 @@ class PageTitleBinding extends StatefulWidget {
     required this.title,
     required this.child,
     this.hideInChrome = false,
+    this.overVideo = false,
   });
 
   final String title;
@@ -78,6 +88,9 @@ class PageTitleBinding extends StatefulWidget {
 
   /// Detail pages show the title in the page body; the chrome repeats nothing.
   final bool hideInChrome;
+
+  /// Full-window video: the chrome keeps its dark set whatever the page below.
+  final bool overVideo;
 
   @override
   State<PageTitleBinding> createState() => _PageTitleBindingState();
@@ -87,6 +100,7 @@ class _PageTitleBindingState extends State<PageTitleBinding> {
   PageTitleController? _controller;
   _TitleNode? _node;
   bool _attachScheduled = false;
+  bool _overVideoApplied = false;
 
   @override
   void didChangeDependencies() {
@@ -122,16 +136,23 @@ class _PageTitleBindingState extends State<PageTitleBinding> {
         return;
       }
       _node = controller.push(widget.title, hide: widget.hideInChrome);
+      if (widget.overVideo) {
+        _overVideoApplied = true;
+        controller.overVideo.value = true;
+      }
     });
   }
 
   void _detach() {
     final controller = _controller;
     final node = _node;
+    final overVideo = _overVideoApplied;
     _node = null;
+    _overVideoApplied = false;
     if (controller == null || node == null) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       controller.release(node);
+      if (overVideo) controller.overVideo.value = false;
     });
   }
 

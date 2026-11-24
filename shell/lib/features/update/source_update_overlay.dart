@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../core/gateway/core_download.dart';
+import '../../core/platform/platform.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/tokens.dart';
 
@@ -22,13 +23,17 @@ class SourceUpdateOverlay extends StatelessWidget {
   final bool restarting;
 
   String get _title {
-    if (restarting) return '更新完成，正在重启程序';
+    if (restarting) {
+      return isMobilePlatform ? '更新完成，正在重新加载' : '更新完成，正在重启程序';
+    }
     if (names.isEmpty) return '正在检查更新';
     return '正在更新 ${names.join('、')}';
   }
 
   String? get _detail {
-    if (restarting) return '请稍候，程序会自动打开';
+    if (restarting) {
+      return isMobilePlatform ? '请稍候，正在应用新版本' : '请稍候，程序会自动打开';
+    }
     final state = progress;
     if (state == null) return '正在下载…';
     final got = (state.received / (1 << 20)).toStringAsFixed(1);
@@ -47,7 +52,8 @@ class SourceUpdateOverlay extends StatelessWidget {
         color: const Color(0xB3000000),
         child: Center(
           child: Container(
-            width: 360,
+            constraints: const BoxConstraints(maxWidth: 360),
+            margin: const EdgeInsets.symmetric(horizontal: AppSpacing.x4),
             padding: const EdgeInsets.all(AppSpacing.x6),
             decoration: BoxDecoration(
               color: colors.surface,

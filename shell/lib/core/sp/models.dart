@@ -389,6 +389,12 @@ class PlayRequest {
     this.quality = 'auto',
     this.maxHeight = 0,
     this.prewarm = false,
+    // Prefer the lossless VVC remux: the bundled libmpv decodes it, and it
+    // starts seconds sooner than an H.264 re-encode. Downloads ask for H.264
+    // explicitly because the file leaves the app.
+    this.transcode = false,
+    this.skipWarm = false,
+    this.preview = false,
   });
 
   final String itemId;
@@ -397,12 +403,29 @@ class PlayRequest {
   final int maxHeight;
   final bool prewarm;
 
+  /// Ask the source for a machine-friendly copy (bytevc2 -> H.264) when the
+  /// player has no decoder for the original codec.
+  final bool transcode;
+
+  /// Plan prefetches only need the URL and key. Warming downloads the video
+  /// and starts an index/transcode job, so a card the viewer never opens would
+  /// still cost CPU and memory.
+  final bool skipWarm;
+
+  /// Feed previews never open the episode list or use next/previous; skipping
+  /// it saves the gateway a video_detail call (hundreds of KB) per card, which
+  /// was the bulk of a cold /play.
+  final bool preview;
+
   Map<String, dynamic> toJson() => {
         'item_id': itemId,
         'episode_id': episodeId,
         'quality': quality,
         if (maxHeight > 0) 'prefer': {'max_height': maxHeight},
         if (prewarm) 'prewarm': true,
+        if (transcode) 'transcode': true,
+        if (skipWarm) 'skip_warm': true,
+        if (preview) 'preview': true,
       };
 }
 
@@ -415,6 +438,7 @@ class MediaPlan {
     this.expiresAt = '',
     this.nextEpisodeId = '',
     this.downgraded = false,
+    this.durationMs = 0,
     this.extra = const {},
   });
 
@@ -425,7 +449,13 @@ class MediaPlan {
   final String expiresAt;
   final String nextEpisodeId;
   final bool downgraded;
+  final int durationMs;
   final Map<String, dynamic> extra;
+
+  /// The source's own duration for this episode. A growing remux stream can
+  /// report no duration through libmpv even though it plays; this keeps the
+  /// progress bar and resume logic meaningful.
+  Duration get duration => Duration(milliseconds: durationMs);
 
   Stream? get bestStream => streams.isEmpty ? null : streams.first;
 
@@ -458,6 +488,7 @@ class MediaPlan {
       expiresAt: str(json['expires_at']),
       nextEpisodeId: str(json['next_episode_id']),
       downgraded: boolOr(json['downgraded']),
+      durationMs: intOr(json['duration_ms']),
       extra: mapOr(json['extra']),
     );
   }

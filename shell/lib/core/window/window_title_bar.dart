@@ -12,11 +12,24 @@ class WindowTitleBar extends StatefulWidget {
     required this.colors,
     required this.themeMode,
     required this.onCycleTheme,
+    this.transparent = false,
+    this.sourceSwitcher,
+    this.showBrand = true,
   });
 
   final AppColors colors;
   final ThemeMode themeMode;
   final VoidCallback onCycleTheme;
+
+  /// Immersive home: the bar floats over the video and paints no surface.
+  final bool transparent;
+
+  /// Transparent source selector, shown left of the theme toggle.
+  final Widget? sourceSwitcher;
+
+  /// A full-screen page shows its own back control where the brand would sit;
+  /// the bar keeps that spot empty (and lets taps through to the page).
+  final bool showBrand;
 
   @override
   State<WindowTitleBar> createState() => _WindowTitleBarState();
@@ -101,17 +114,29 @@ class _WindowTitleBarState extends State<WindowTitleBar> {
         child: AnimatedContainer(
           duration: AppDuration.page,
           curve: AppDuration.ease,
-          height: 36,
-          color: colors.surface,
+          height: AppSizes.titleBar,
+          // A transparent bar paints nothing at all: a transparent colour
+          // would still claim hit tests and block the page's back button.
+          color: widget.transparent ? null : colors.surface,
           child: Row(
             children: [
-              const SizedBox(width: AppSpacing.x3),
-              Icon(Icons.play_circle_fill, size: 14, color: colors.accent),
-              const SizedBox(width: AppSpacing.x2),
-              Text(
-                AppStrings.appName,
-                style: TextStyle(fontSize: 11, color: colors.text2),
-              ),
+              if (widget.showBrand) ...[
+                const SizedBox(width: AppSpacing.x3),
+                IgnorePointer(
+                  child:
+                      Icon(Icons.play_circle_fill, size: 14, color: colors.accent),
+                ),
+                const SizedBox(width: AppSpacing.x2),
+                IgnorePointer(
+                  child: Text(
+                    AppStrings.appName,
+                    style: TextStyle(fontSize: 11, color: colors.text2),
+                  ),
+                ),
+              ] else
+                // Room for the page's own back button; taps fall through and
+                // the drag strip starts to the right of it.
+                const SizedBox(width: 64),
               Expanded(
                 child: Listener(
                   behavior: HitTestBehavior.opaque,
@@ -125,6 +150,8 @@ class _WindowTitleBarState extends State<WindowTitleBar> {
                   child: const SizedBox.expand(),
                 ),
               ),
+              if (widget.sourceSwitcher != null) widget.sourceSwitcher!,
+              const SizedBox(width: AppSpacing.x1),
               _WindowButton(
                 id: 'theme',
                 icon: _themeIcon(widget.themeMode),
@@ -134,14 +161,6 @@ class _WindowTitleBarState extends State<WindowTitleBar> {
                 hovered: _hoveredButton == 'theme',
                 onHover: _setHovered,
                 onTap: () async => widget.onCycleTheme(),
-              ),
-              Container(
-                width: 1,
-                height: 16,
-                margin: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.x1,
-                ),
-                color: colors.border,
               ),
               _WindowButton(
                 id: 'min',
@@ -221,7 +240,7 @@ class _WindowButton extends StatelessWidget {
           onTap: () => onTap(),
           child: Container(
             width: width,
-            height: 36,
+            height: AppSizes.titleBar,
             color: background,
             alignment: Alignment.center,
             child: Icon(icon, size: 14, color: foreground),

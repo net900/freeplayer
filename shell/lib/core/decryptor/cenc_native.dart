@@ -103,8 +103,11 @@ class CencIndex {
   }
 }
 
-/// FFI binding for decryptors\cenc_decrypt.dll. The library only decrypts
-/// CENC-AES-CTR and parses the MP4 index; keys and streams come from the API.
+/// FFI binding for the CENC decryptor. Windows loads the DLL beside the app;
+/// Android loads `libcenc_decrypt.so` from the APK's native libraries, built
+/// from the same `native/cenc` source by Gradle/CMake. The library only
+/// decrypts CENC-AES-CTR and parses the MP4 index; keys and streams come
+/// from the API.
 class CencNative {
   CencNative._(
     this._create,
@@ -131,6 +134,12 @@ class CencNative {
     defaultValue: 'cenc_decrypt.dll',
   );
 
+  /// Packaged into the APK by `android/app/src/main/cpp/CMakeLists.txt`.
+  static const String androidLibraryName = String.fromEnvironment(
+    'FREEPLAYER_CENC_SO',
+    defaultValue: 'libcenc_decrypt.so',
+  );
+
   /// The source core carries the same fp_cenc_* exports, so a single file
   /// serves both roles and only one download is needed.
   static const String coreLibraryName = String.fromEnvironment(
@@ -138,10 +147,18 @@ class CencNative {
     defaultValue: 'freeplayer_core.dll',
   );
 
-  /// Loads the library on first use; null when neither file is available.
+  /// Loads the library on first use; null when none is available.
   static CencNative? ensureLoaded() {
     final existing = _instance;
     if (existing != null) return existing;
+    if (Platform.isAndroid) {
+      // A bare soname is resolved from the APK's read-only native library
+      // directory. Android 10+ refuses executable mappings from writable app
+      // data, so this library is bundled rather than downloaded.
+      final native = _open(androidLibraryName);
+      if (native != null) _instance = native;
+      return native;
+    }
     for (final name in [libraryName, coreLibraryName]) {
       final path = findLibrary(name);
       if (path == null) continue;
@@ -180,6 +197,9 @@ class CencNative {
   }
 
   static String? findLibrary([String name = libraryName]) {
+    // Android loads the soname from the APK; there is no filesystem copy to
+    // search (and no writable path that could be mapped executable).
+    if (Platform.isAndroid) return null;
     final exeDir = File(Platform.resolvedExecutable).parent.path;
     final current = Directory.current.path;
     // Sources install verified modules under decryptors/<id>/<version>/.

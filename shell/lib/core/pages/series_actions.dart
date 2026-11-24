@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app/app_scope.dart';
 import '../gateway/source_api.dart';
 import '../library/local_library.dart';
+import '../theme/app_theme.dart';
 import '../sp/models.dart';
 import '../theme/tokens.dart';
 import 'comment_sheet.dart';
@@ -10,7 +11,7 @@ import 'common.dart';
 import 'login_sheet.dart';
 
 /// One round button of the vertical rail (feed and player share it).
-class RailAction extends StatelessWidget {
+class RailAction extends StatefulWidget {
   const RailAction({
     super.key,
     required this.icon,
@@ -25,33 +26,65 @@ class RailAction extends StatelessWidget {
   final VoidCallback? onTap;
 
   @override
+  State<RailAction> createState() => _RailActionState();
+}
+
+class _RailActionState extends State<RailAction> {
+  bool _hover = false;
+
+  @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 44,
-            height: 44,
-            decoration: const BoxDecoration(
-              color: Color(0x40000000),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(icon, color: color, size: 24),
+    final enabled = widget.onTap != null;
+    final hover = _hover && enabled;
+    return MouseRegion(
+      cursor: enabled ? SystemMouseCursors.click : MouseCursor.defer,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onTap,
+        child: AnimatedScale(
+          scale: hover ? 1.07 : 1,
+          duration: AppDuration.micro,
+          curve: AppDuration.ease,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AnimatedContainer(
+                duration: AppDuration.micro,
+                curve: AppDuration.ease,
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: hover
+                      ? const Color(0x73000000)
+                      : const Color(0x40000000),
+                  shape: BoxShape.circle,
+                  boxShadow: hover
+                      ? [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.4),
+                            blurRadius: 14,
+                            offset: const Offset(0, 4),
+                          ),
+                        ]
+                      : const [],
+                ),
+                child: Icon(widget.icon, color: widget.color, size: 24),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                widget.value,
+                style: const TextStyle(
+                  fontSize: AppFontSize.xxs,
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                  shadows: [Shadow(color: Color(0x99000000), blurRadius: 6)],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 2),
-          Text(
-            value,
-            style: const TextStyle(
-              fontSize: AppFontSize.xxs,
-              color: Colors.white,
-              fontWeight: FontWeight.w600,
-              shadows: [Shadow(color: Color(0x99000000), blurRadius: 6)],
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -220,12 +253,13 @@ class _SeriesActionRailState extends State<SeriesActionRail> {
 
   @override
   Widget build(BuildContext context) {
+    final colors = AppTokens.of(context).colors;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         RailAction(
           icon: _liked ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-          color: _liked ? const Color(0xFFFF5A6E) : Colors.white,
+          color: _liked ? colors.like : Colors.white,
           value: formatCount(_likeCount),
           onTap: _toggleLike,
         ),
@@ -234,7 +268,7 @@ class _SeriesActionRailState extends State<SeriesActionRail> {
           icon: _favorite
               ? Icons.bookmark_added_rounded
               : Icons.bookmark_border_rounded,
-          color: _favorite ? const Color(0xFFFFC24B) : Colors.white,
+          color: _favorite ? colors.favorite : Colors.white,
           value: formatCount(
             widget.stats?.followCount ?? _extraInt(widget.item.extra['follow_count']),
           ),

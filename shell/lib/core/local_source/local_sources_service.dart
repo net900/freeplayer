@@ -7,6 +7,8 @@ import 'package:crypto/crypto.dart';
 import '../../app/app_controller.dart';
 import '../gateway/models.dart';
 import '../gateway/recommended_sources.dart';
+import '../platform/android_host.dart';
+import '../platform/platform.dart';
 import '../storage/local_store.dart';
 import '../storage/paths.dart';
 import 'local_js_source_api.dart';
@@ -190,6 +192,10 @@ class LocalSourcesService {
     final dir = directory;
     if (!dir.existsSync()) {
       dir.createSync(recursive: true);
+    }
+    if (isMobilePlatform) {
+      await AndroidHost.openFolder(dir.path);
+      return;
     }
     try {
       if (Platform.isWindows) {

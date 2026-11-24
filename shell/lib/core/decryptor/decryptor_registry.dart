@@ -238,7 +238,9 @@ class DecryptorRegistry {
               ? 'linux'
               : Platform.isMacOS
                   ? 'macos'
-                  : '';
+                  : Platform.isAndroid
+                      ? 'android'
+                      : '';
       final osMatches = current == os || (current == 'macos' && os == 'darwin');
       if (!osMatches) return false;
     }
@@ -268,9 +270,9 @@ class DecryptorRegistry {
     if (raw.isNotEmpty && raw.contains('.')) return _safe(raw);
     final ext = switch (spec.os.toLowerCase()) {
       'windows' => 'dll',
-      'linux' => 'so',
+      'linux' || 'android' => 'so',
       'macos' || 'darwin' => 'dylib',
-      _ => 'dll',
+      _ => Platform.isAndroid ? 'so' : 'dll',
     };
     return 'fp_decryptor_${_safe(spec.id)}.$ext';
   }

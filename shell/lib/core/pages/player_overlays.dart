@@ -39,11 +39,27 @@ class DanmakuLayer extends StatefulWidget {
 }
 
 class _DanmakuLayerState extends State<DanmakuLayer> {
-  static const double _travel = 20;
+  static const double _travelSeconds = 20;
   static const double _topHold = 8;
 
   DanmakuLine? _selected;
   double _frozenAge = 0;
+
+  // Lane assignment and emoji rendering depend only on the line list, the
+  // viewport and the display settings. Recomputing them on every playhead
+  // tick meant sorting all lines and scanning the emoji table twice per line
+  // ~16 times a second; the cache makes a tick O(visible lines).
+  List<DanmakuLine>? _layoutLines;
+  double _layoutWidth = -1;
+  double _layoutHeight = -1;
+  double _layoutFontSize = -1;
+  double _layoutSpeed = -1;
+  Map<DanmakuLine, int> _laneOf = const {};
+  Map<DanmakuLine, int> _topOf = const {};
+  Map<DanmakuLine, String> _textOf = const {};
+  int _laneCount = 0;
+  double _laneStep = 0;
+  double _travel = _travelSeconds;
 
   void _select(DanmakuLine line, double age) {
     setState(() {
@@ -104,73 +120,96 @@ class _DanmakuLayerState extends State<DanmakuLayer> {
     }
   }
 
+  void _ensureLayout(
+    double width,
+    double height,
+    double fontSize,
+    double speed,
+  ) {
+    if (identical(widget.lines, _layoutLines) &&
+        width == _layoutWidth &&
+        height == _layoutHeight &&
+        fontSize == _layoutFontSize &&
+        speed == _layoutSpeed) {
+      return;
+    }
+    _layoutLines = widget.lines;
+    _layoutWidth = width;
+    _layoutHeight = height;
+    _layoutFontSize = fontSize;
+    _layoutSpeed = speed;
+    _travel = _travelSeconds / speed.clamp(0.5, 2.5);
+    _laneStep = fontSize + 14;
+    _laneCount = (height * 0.35 / _laneStep).clamp(2, 10).toInt();
+    final laneReady = List<double>.filled(_laneCount, -1e9);
+    final laneWidth = List<double>.filled(_laneCount, 0);
+    final laneOf = <DanmakuLine, int>{};
+    final topOf = <DanmakuLine, int>{};
+    final textOf = <DanmakuLine, String>{};
+    final topReady = List<double>.filled(2, -1e9);
+    final sorted = [...widget.lines]..sort((a, b) => a.time.compareTo(b.time));
+    for (final line in sorted) {
+      final rendered = renderEmoji(line.text);
+      textOf[line] = rendered;
+      if (line.mode == 'top') {
+        var slot = -1;
+        for (var i = 0; i < topReady.length; i++) {
+          if (line.time - topReady[i] >= _topHold) {
+            slot = i;
+            break;
+          }
+        }
+        if (slot < 0) continue;
+        topReady[slot] = line.time;
+        topOf[line] = slot;
+        continue;
+      }
+      final textWidth =
+          (rendered.runes.length * fontSize).clamp(40.0, width * 0.7);
+      final lineSpeed = (width + textWidth) / _travel;
+      var lane = -1;
+      for (var i = 0; i < _laneCount; i++) {
+        // The previous line's own width decides how long it still covers the
+        // entrance, not the new line's width.
+        final cleared = (line.time - laneReady[i]) * lineSpeed;
+        if (cleared >= laneWidth[i] + 56) {
+          lane = i;
+          break;
+        }
+      }
+      if (lane < 0) continue;
+      laneReady[lane] = line.time;
+      laneWidth[lane] = textWidth;
+      laneOf[line] = lane;
+    }
+    _laneOf = laneOf;
+    _topOf = topOf;
+    _textOf = textOf;
+  }
+
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<PlaybackSnapshot>(
-      valueListenable: widget.engine.snapshot,
-      builder: (context, snapshot, _) {
-        final position = snapshot.position.inMilliseconds / 1000.0;
+    // Only the playhead drives this layer; play/pause, volume and errors stay
+    // on the coarse snapshot.
+    return ValueListenableBuilder<Duration>(
+      valueListenable: widget.engine.position,
+      builder: (context, position, _) {
+        final seconds = position.inMilliseconds / 1000.0;
         return LayoutBuilder(
           builder: (context, constraints) {
             final width = constraints.maxWidth;
+            final height = constraints.maxHeight;
             final fontSize = widget.fontSize;
-            final travel = _travel / widget.speed.clamp(0.5, 2.5);
-            final laneStep = fontSize + 14;
-            final laneCount =
-                (constraints.maxHeight * 0.35 / laneStep).clamp(2, 10).toInt();
-            // Assign each line a lane once, in time order: a lane only takes a
-            // new line after the previous one has moved far enough that the
-            // texts cannot touch. Lines that find no free lane are skipped
-            // instead of stacking on top of each other.
-            final laneReady = List<double>.filled(laneCount, -1e9);
-            final laneWidth = List<double>.filled(laneCount, 0);
-            final laneOf = <DanmakuLine, int>{};
-            final topOf = <DanmakuLine, int>{};
-            final topReady = List<double>.filled(2, -1e9);
-            final sorted = [...widget.lines]
-              ..sort((a, b) => a.time.compareTo(b.time));
-            for (final line in sorted) {
-              if (line.mode == 'top') {
-                var slot = -1;
-                for (var i = 0; i < topReady.length; i++) {
-                  if (line.time - topReady[i] >= _topHold) {
-                    slot = i;
-                    break;
-                  }
-                }
-                if (slot < 0) continue;
-                topReady[slot] = line.time;
-                topOf[line] = slot;
-                continue;
-              }
-              final textWidth =
-                  (renderEmoji(line.text).runes.length * fontSize)
-                      .clamp(40.0, width * 0.7);
-              final speed = (width + textWidth) / travel;
-              var lane = -1;
-              for (var i = 0; i < laneCount; i++) {
-                // The previous line's own width decides how long it still
-                // covers the entrance, not the new line's width.
-                final cleared = (line.time - laneReady[i]) * speed;
-                if (cleared >= laneWidth[i] + 56) {
-                  lane = i;
-                  break;
-                }
-              }
-              if (lane < 0) continue;
-              laneReady[lane] = line.time;
-              laneWidth[lane] = textWidth;
-              laneOf[line] = lane;
-            }
+            _ensureLayout(width, height, fontSize, widget.speed);
             final widgets = <Widget>[];
             for (final line in widget.lines) {
               final selected = identical(line, _selected);
-              final age = selected ? _frozenAge : position - line.time;
+              final age = selected ? _frozenAge : seconds - line.time;
               if (age < 0) continue;
               final color = _colorOf(line.color)
                   .withValues(alpha: widget.opacity.clamp(0.25, 1.0));
               if (line.mode == 'top') {
-                final slot = topOf[line];
+                final slot = _topOf[line];
                 if (slot == null || age > _topHold) continue;
                 widgets.add(
                   Positioned(
@@ -179,7 +218,7 @@ class _DanmakuLayerState extends State<DanmakuLayer> {
                     right: 0,
                     child: Center(
                       child: Text(
-                        line.text,
+                        _textOf[line] ?? line.text,
                         style: TextStyle(
                           color: color,
                           fontSize: fontSize + 2,
@@ -194,11 +233,11 @@ class _DanmakuLayerState extends State<DanmakuLayer> {
                 );
                 continue;
               }
-              final lane = laneOf[line];
-              if (lane == null || (!selected && age > travel)) continue;
-              final progress = age / travel;
+              final lane = _laneOf[line];
+              if (lane == null || (!selected && age > _travel)) continue;
+              final progress = age / _travel;
               final text = Text(
-                renderEmoji(line.text),
+                _textOf[line] ?? line.text,
                 style: TextStyle(
                   color: selected ? Colors.white : color,
                   fontSize: fontSize,
@@ -210,7 +249,7 @@ class _DanmakuLayerState extends State<DanmakuLayer> {
               );
               widgets.add(
                 Positioned(
-                  top: 40 + lane * laneStep,
+                  top: 40 + lane * _laneStep,
                   left: width * (1 - progress) - 40,
                   child: selected
                       ? MouseRegion(
@@ -237,7 +276,7 @@ class _DanmakuLayerState extends State<DanmakuLayer> {
                         )
                       : MouseRegion(
                           cursor: SystemMouseCursors.click,
-                          onEnter: (_) => _select(line, position - line.time),
+                          onEnter: (_) => _select(line, seconds - line.time),
                           child: text,
                         ),
                 ),
@@ -350,6 +389,7 @@ class _PlayerInfoCardState extends State<PlayerInfoCard> {
   @override
   Widget build(BuildContext context) {
     final item = widget.item;
+    final tokens = AppTokens.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -365,12 +405,14 @@ class _PlayerInfoCardState extends State<PlayerInfoCard> {
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: 22,
+                fontSize: AppFontSize.h3,
                 fontWeight: FontWeight.w700,
                 color: Colors.white,
                 decoration: _hover ? TextDecoration.underline : null,
                 decorationColor: Colors.white70,
-                shadows: const [Shadow(color: Color(0x99000000), blurRadius: 8)],
+                shadows: const [
+                  Shadow(color: Color(0x99000000), blurRadius: 8)
+                ],
               ),
             ),
           ),
@@ -396,14 +438,16 @@ class _PlayerInfoCardState extends State<PlayerInfoCard> {
                     vertical: 1,
                   ),
                   decoration: BoxDecoration(
-                    color: const Color(0x3327C48B),
+                    color: tokens.colors.local.withValues(alpha: 0.18),
                     borderRadius: BorderRadius.circular(AppRadius.sm),
-                    border: Border.all(color: const Color(0x8827C48B)),
+                    border: Border.all(
+                      color: tokens.colors.local.withValues(alpha: 0.55),
+                    ),
                   ),
-                  child: const Text(
+                  child: Text(
                     '本地',
                     style: TextStyle(
-                      color: Color(0xFF7BE3B4),
+                      color: tokens.colors.local,
                       fontSize: 10,
                       fontWeight: FontWeight.w600,
                     ),
@@ -455,6 +499,7 @@ class _EpisodeDrawerState extends State<EpisodeDrawer> {
 
   final GlobalKey _currentKey = GlobalKey();
   late final ScrollController _controller;
+  String? _hoveredId;
 
   @override
   void initState() {
@@ -562,8 +607,7 @@ class _EpisodeDrawerState extends State<EpisodeDrawer> {
                     spacing: AppSpacing.x2,
                     runSpacing: AppSpacing.x2,
                     children: [
-                      for (final episode in group)
-                        _chip(context, episode),
+                      for (final episode in group) _chip(context, episode),
                     ],
                   ),
                   const SizedBox(height: AppSpacing.x3),
@@ -580,28 +624,41 @@ class _EpisodeDrawerState extends State<EpisodeDrawer> {
     final tokens = AppTokens.of(context);
     final selected = episode.id == widget.currentId;
     final watched = widget.watched.contains(episode.id);
+    final hovered = _hoveredId == episode.id;
     final fg = selected
         ? tokens.colors.accent
         : (watched ? tokens.colors.text : tokens.colors.text2);
-    return GestureDetector(
+    return MouseRegion(
       key: selected ? _currentKey : null,
-      behavior: HitTestBehavior.opaque,
-      onTap: () => widget.onSelect(episode),
-      child: Container(
-        width: 74,
-        height: 34,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected || watched
-              ? tokens.colors.accentWeak
-              : tokens.colors.surface2,
-          borderRadius: BorderRadius.circular(AppRadius.sm),
-          border: Border.all(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hoveredId = episode.id),
+      onExit: (_) {
+        if (_hoveredId == episode.id) setState(() => _hoveredId = null);
+      },
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => widget.onSelect(episode),
+        child: AnimatedContainer(
+          duration: AppDuration.micro,
+          curve: AppDuration.ease,
+          width: 74,
+          height: 34,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
             color: selected || watched
-                ? tokens.colors.accent
-                : tokens.colors.border,
+                ? tokens.colors.accentWeak
+                : hovered
+                    ? tokens.colors.surface3
+                    : tokens.colors.surface2,
+            borderRadius: BorderRadius.circular(AppRadius.sm),
+            border: Border.all(
+              color: selected || watched
+                  ? tokens.colors.accent
+                  : hovered
+                      ? tokens.colors.text3
+                      : tokens.colors.border,
+            ),
           ),
-        ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -618,6 +675,7 @@ class _EpisodeDrawerState extends State<EpisodeDrawer> {
               ),
             ),
           ],
+        ),
         ),
       ),
     );
